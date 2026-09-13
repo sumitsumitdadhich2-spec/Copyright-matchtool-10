@@ -64,15 +64,23 @@ export function parseBatchVerifierResponse(
       for (const item of list) {
         const idx = Number(item.partIndex || item.part || item.index)
         if (partsMap.has(idx)) {
-          const rawVerdict = String(item.verdict || '').toUpperCase()
+          const rawVerdict = String(item.verdict || '').toUpperCase().trim()
           const confidence = typeof item.confidence === 'number' ? item.confidence : 0.9
-          // Strict confidence threshold: if confidence is low (< 0.75), treat as REJECTED to prevent false confirms
+          // Strict confidence threshold: must be explicitly confirmed, no rejection/mismatch indicators, confidence >= 0.85
           const isConfirmed =
-            (rawVerdict.includes('CONFIRM') || rawVerdict.includes('SAME') || rawVerdict.includes('MATCH')) &&
-            confidence >= 0.75
+            (rawVerdict === 'CONFIRMED' || rawVerdict === 'SAME' || rawVerdict === 'MATCH' || rawVerdict === 'CONFIRM') &&
+            !rawVerdict.includes('REJECT') &&
+            !rawVerdict.includes('MISMATCH') &&
+            !rawVerdict.includes('NOT') &&
+            !rawVerdict.includes('DIFFERENT') &&
+            !rawVerdict.includes('DIFF') &&
+            confidence >= 0.85
 
           const cropDetail = item.cropPosition ? ` [Crop: ${String(item.cropPosition).trim()}]` : ''
           const anchorProof = item.visualAnchorProof ? ` [Anchor: ${String(item.visualAnchorProof).trim()}]` : ''
+          const mismatchStr = item.mismatchDetail && !String(item.mismatchDetail).toLowerCase().includes('none')
+            ? ` [Fark: ${String(item.mismatchDetail).trim()}]`
+            : ''
           const baseReason = item.reason
             ? String(item.reason).trim()
             : isConfirmed
@@ -85,7 +93,7 @@ export function parseBatchVerifierResponse(
             verdict: isConfirmed ? 'CONFIRMED' : 'REJECTED',
             confidence,
             visualAnchorProof: item.visualAnchorProof ? String(item.visualAnchorProof).trim() : undefined,
-            reason: `${baseReason}${cropDetail}${anchorProof}`,
+            reason: `${baseReason}${mismatchStr}${cropDetail}${anchorProof}`,
             rescanRequired: !isConfirmed,
           })
         }
@@ -102,7 +110,7 @@ export function parseBatchVerifierResponse(
     const match = pRegex.exec(rawText)
     if (match) {
       const vText = match[1].toUpperCase()
-      const isConfirmed = vText === 'CONFIRMED' || vText === 'SAME' || vText === 'MATCH'
+      const isConfirmed = (vText === 'CONFIRMED' || vText === 'SAME' || vText === 'MATCH') && vText !== 'MISMATCH' && !vText.includes('DIFF')
       const existing = partsMap.get(p.partIndex)!
       partsMap.set(p.partIndex, {
         ...existing,
@@ -222,7 +230,7 @@ export async function verifySingleMinute(
     )
 
     let attempts = 0
-    const maxAttempts = 3
+    const maxAttempts = 4
     let verifiedParts: BatchVerifyPart[] = []
     let chosenModel = ''
 
@@ -292,6 +300,16 @@ export async function verifySingleMinute(
           'warn',
           `[Batch Verifier] Min ${minuteIndex + 1} attempt ${attempts} failed on ${chosenModel || 'model'}: ${geminiErr.message}`,
         )
+
+        // Prohibited content error: DO NOT RETRY - Stop immediately
+        if (geminiErr.kind === 'policy_blocked') {
+          logScan(
+            scanId,
+            'error',
+            `[Batch Verifier] Prohibited content detected on Minute ${minuteIndex + 1}. Stopping immediately without retry.`,
+          )
+          throw err
+        }
 
         if (attempts >= maxAttempts) {
           throw err
@@ -628,28 +646,40 @@ export async function startBatchVerificationAll(scanId: string): Promise<void> {
   state.progress = `Starting verification across ${minuteCount} minute(s)...`
   saveScan(scan)
 
-  logScan(scanId, 'info', `[Batch Verifier] Starting all-in-one 24 FPS verification for ${minuteCount} minute(s)...`)
+  logScan(scanId, 'info', `[Batch Verifier] Starting parallel 24 FPS verification for ${minuteCount} minute(s) across available API keys & models...`)
 
-  // Process minutes in parallel / available lane pool
-  const minutePromises = Array.from({ length: minuteCount }, (_, minIdx) => minIdx).map(async (minIdx) => {
+  // Process minutes in parallel across coordinator lanes (different API keys & models)
+  void (async () => {
     try {
-      if (token.isCancelled()) return
-      await verifySingleMinute(scanId, minIdx, token)
-    } catch (err) {
-      console.warn(`[Batch Verifier] Error in minute ${minIdx + 1}:`, err)
-    }
-  })
+      const minutePromises = Array.from({ length: minuteCount }, (_, minIdx) => minIdx).map(async (minIdx) => {
+        if (token.isCancelled()) return
+        try {
+          await verifySingleMinute(scanId, minIdx, token)
+        } catch (err) {
+          console.warn(`[Batch Verifier] Error in minute ${minIdx + 1}:`, err)
+          const ge = classifyError(err)
+          if (ge.kind === 'policy_blocked') {
+            logScan(
+              scanId,
+              'error',
+              `[Batch Verifier] Prohibited content detected on Minute ${minIdx + 1}.`,
+            )
+          }
+        }
+      })
 
-  void Promise.allSettled(minutePromises).then(() => {
-    activeCancelTokens.delete(scanId)
-    const latestScan = getScan(scanId)
-    if (latestScan && latestScan.batchVerify) {
-      latestScan.batchVerify.status = token.isCancelled() ? 'stopped' : 'done'
-      latestScan.batchVerify.finishedAt = Date.now()
-      saveScan(latestScan)
-      logScan(scanId, 'success', `[Batch Verifier] All ${minuteCount} minute(s) verification completed.`)
+      await Promise.allSettled(minutePromises)
+    } finally {
+      activeCancelTokens.delete(scanId)
+      const latestScan = getScan(scanId)
+      if (latestScan && latestScan.batchVerify) {
+        latestScan.batchVerify.status = token.isCancelled() ? 'stopped' : 'done'
+        latestScan.batchVerify.finishedAt = Date.now()
+        saveScan(latestScan)
+        logScan(scanId, 'success', `[Batch Verifier] All ${minuteCount} minute(s) verification completed.`)
+      }
     }
-  })
+  })()
 }
 
 /**

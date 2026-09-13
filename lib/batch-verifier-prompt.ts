@@ -16,95 +16,75 @@ export function buildBatchVerifierPrompt(parts: BatchVerifyPart[]): string {
     .join('\n')
 
   return `You are an ULTRA-STRICT, ADVERSARIAL FORENSIC VIDEO AUDITOR.
-Your mandate is to ELIMINATE ALL FALSE POSITIVES with zero leniency.
-You are comparing TWO synchronized 24 FPS stitched video streams:
-- Video 1: Stitched SHORT VIDEO / REEL clips (Vertical 9:16 format, 24 FPS CFR).
-- Video 2: Stitched CANDIDATE ORIGINAL MOVIE clips (Widescreen 16:9 format, 24 FPS CFR).
+Tumhara ek hi mandate hai: FALSE POSITIVES KO ZERO KARNA. ZABARDASTI CONFIRM KARNA STRICTLY FORBIDDEN HAI.
 
-Both streams are stitched frame-accurately at 24 FPS to an identical local timeline.
+Tumhare paas 24 FPS par synchronize kiye gaye DO stitched video streams hain:
+- Video 1: Stitched SHORT VIDEO / REEL clips (Vertical 9:16 format, exactly 24 FPS CFR). Missing unmapped gaps short video se hata kar sirf matched scenes stitch kiye gaye hain.
+- Video 2: Stitched CANDIDATE ORIGINAL MOVIE clips (Widescreen 16:9 format, exactly 24 FPS CFR).
 
-=========================================
-🚨 CRITICAL MANDATE: AVOID FALSE POSITIVES AT ALL COSTS
-=========================================
-- A FALSE POSITIVE (approving a wrong clip) CORRUPTS THE ENTIRE EXPORT.
-- A REJECTION is safe: any rejected clip automatically triggers a full-chunk rescan to find the true match.
-- If you have even a 1% doubt or if timing is offset by even 0.25 seconds, YOU MUST REJECT.
-- Default to REJECTED unless the visual evidence is 100% indisputable.
+Dono videos ek hi local timeline par frame-accurate 24 FPS par aligned hain.
+Video 1 (9:16) Video 2 (16:9) ka spatial crop hai (Left, Center, ya Right crop).
 
 =========================================
-🔇 AUDIO RULE: 100% PURE VISUAL ANALYSIS (IGNORE AUDIO)
-=========================================
-- Video 1 (Short) contains third-party voiceover / background music / external narration.
-- DO NOT listen to audio or attempt lip-syncing.
-- Evaluate SOLELY based on visual pixel footage at 24 FPS.
-
-=========================================
-📐 CROPPING & SPATIAL GEOMETRY (9:16 CROP OF 16:9)
-=========================================
-- Video 1 is a 9:16 vertical crop of Video 2 (16:9 widescreen).
-- The crop may be positioned on the Left, Center, Right, or dynamically panning/zoomed.
-- Your task: Verify that the visible content in Video 1 is the EXACT SAME SPATIAL REGION of Video 2 at that EXACT SUB-SECOND MOMENT.
-
-=========================================
-⚠️ THE "SAME SCENE / WRONG SECOND" TRAP (THE #1 SOURCE OF ERRORS)
-=========================================
-Actors stay in the same room wearing the same clothes for 3–5 minutes.
-Search models often return a clip from the SAME SCENE but 5, 10, or 30 seconds away from the true moment!
-- SAME ACTOR + SAME CLOTHES + SAME ROOM IS NOT A MATCH!
-- You MUST verify the EXACT PHYSICAL MICRO-ACTION occurring at each fraction of a second.
-
-Examples of FALSE MATCHES (MUST BE REJECTED):
-❌ Video 1 actor is reaching out with right hand; Video 2 actor is reaching with left hand or standing still. -> REJECT!
-❌ Video 1 character turns head from left to right; Video 2 character has head already turned. -> REJECT!
-❌ Video 1 shows glass being placed on table; Video 2 shows glass being held in hand. -> REJECT!
-❌ Video 1 character is blinking/speaking; Video 2 character has mouth closed and eyes wide open. -> REJECT!
-❌ Timing is shifted by even 0.3 seconds: action starts too early or too late. -> REJECT!
-
-=========================================
-TIMELINE PART MAP (${parts.length} PAIRED SEGMENTS)
+TIMELINE PART MAP (${parts.length} PAIRED SEGMENTS TO AUDIT):
 =========================================
 ${partLines}
 
 =========================================
-STRICT 6-POINT FORENSIC VERIFICATION CRITERIA
-For EACH part, check:
+🚨 REVERSE TECHNIQUE & STRICT FORENSIC RULES:
 =========================================
-1. MICRO-MOTION & TRAJECTORY SYNCHRONIZATION:
-   - Arms, hands, fingers: exact angle of movement, speed, and extension.
-   - Body posture: exact degree of lean, sitting vs rising, spine curvature.
-   - Head & gaze: exact direction of turn, tilt angle, eye movement.
+Tumhe "Match" dhoondhne ki koshish NAHI karni. Tumhe "FARK / DISCREPANCY" dhoondhna hai ki KAHAN PAR SCENE MATCH NAHI HO RAHA HAI!
+DEFAULT ASSUMPTION: Har candidate segment GALAT hai jab tak ki har single frame par exact 1:1 micro-action prove na ho jaye.
 
-2. PROPS & OBJECT STATES:
-   - Exact prop held, its orientation, and interaction state (cup at lips vs on table, phone in pocket vs in hand).
+STRICT RULES:
+1. REVERSE AUDIT PRINCIPLE (Mismatch Hunter):
+   - Tumhara kaam ye pata lagana hai ki Video 1 aur Video 2 me KYA FARK HAI.
+   - Agar tumne koi bhi fark pakda (chahe 0.2 second ka offset ho, ya actor ka haath alag ho), to wo segment TURANT REJECT hoga.
 
-3. CHRONOMETRIC TIMING PRECISION:
-   - If an event happens at +0.3s in Video 1, it MUST happen at +0.3s in Video 2.
+2. THE "SAME SCENE / WRONG SECOND" TRAP (Sabse Common Dhokha):
+   - Ek hi scene me actors 3 se 5 minute tak ek hi kamre me same kapde pehan kar rehte hain.
+   - SAME ACTOR + SAME CLOTHES + SAME ROOM IS NOT A MATCH!
+   - Agar candidate us scene ke 5, 10 ya 30 second aage/pichhe ka hai to wo 100% REJECT hai.
+   - Example Mismatch (REJECT): Video 1 me character right hand se cup utha raha hai; Video 2 me cup pehle se haath me hai ya left hand se utha raha hai -> REJECT!
+   - Example Mismatch (REJECT): Video 1 me character left mud raha hai; Video 2 me stationary khada hai -> REJECT!
+   - Example Mismatch (REJECT): Video 1 me dialogue shuru ho raha hai; Video 2 me dialogue bol chuka hai -> REJECT!
 
-4. FACIAL EXPRESSIONS & MICRO-FEATURES:
-   - Mouth shapes, eyebrow position, smile/frown tension, blink timing.
+3. 1:1 SUB-SECOND MICRO-ACTION PRECISION (24 FPS):
+   - Har 1/24 second frame par:
+     * Ungliyon, haathon aur baahon ki position aur angle.
+     * Chehre ke expressions, eyebrow movement, smile, blink timing.
+     * Gardan aur aankhon ka ghumna (gaze trajectory).
+     * Props ka status (phone, glass, gun, knife, cigarette, etc.).
+   - Agar koi bhi micro-action Video 1 aur Video 2 me alag hai to wo different moment hai -> REJECT!
 
-5. LIGHTING, SHADOWS & BACKGROUND DETAILS:
-   - Moving shadows, background objects, secondary extras passing by.
+4. 1% DOUBT = INSTANT REJECT:
+   - Rescan system rejected scene ka naya scan run karke sahi timestamp dhoondh lega.
+   - Lekin ek galat scene ko "CONFIRMED" kehna poore export video ko barbad kar deta hai.
+   - Isliye agar 1% bhi shak ya blurriness ya timing shift lage to REJECT karo.
 
-6. CUT / SCENE TRANSITION BOUNDARIES:
-   - If there is a camera cut, it must happen at the exact same sub-second frame in both.
+5. AUDIO & DIALOGUE VERIFICATION:
+   - Video 1 (Short) me narration ya background music ho sakta hai, lekin agar characters bol rahe hain to unke hontho ki movement (lip movement) aur reaction Video 2 ke original scene se 100% sync hone chahiye.
 
-=========================================
-PERMISSIBLE NON-MISMATCH ARTIFACTS:
-=========================================
-- Watermarks, subtitles, text stickers, creator emojis, or overlays on Video 1.
-- Color saturation / contrast boosts or compression artifacts.
+Respond in Hinglish (Hindi written in Latin script) with structured forensic analysis followed by JSON verdicts.
 
-=========================================
-DECISION THRESHOLDS:
-=========================================
-- "CONFIRMED": ONLY when you are 100% positive that EVERY frame of Video 1 is the exact spatial crop of Video 2 at that exact fraction of a second. Confidence MUST BE >= 0.92.
-- "REJECTED": If there is ANY discrepancy in action, posture, prop, or timing. rescanRequired: true.
+Your answer has exactly TWO parts:
 
-=========================================
-REQUIRED OUTPUT FORMAT (JSON ONLY)
-=========================================
-Respond with a single valid JSON object containing an array of verdicts for all ${parts.length} parts:
+=====================
+HISSA 1 — REVERSE DISCREPANCY AUDIT (KAHAN MATCH NAHI HO RAHA HAI)
+=====================
+Har single PART (PART 1 se PART ${parts.length}) ke liye Video 1 aur Video 2 ko 24 fps par frame-by-frame scrutinize karo.
+Har PART ke liye likho:
+PART <n> [mm:ss.mmm - mm:ss.mmm]:
+- KAHAN MATCH NAHI HO RAHA / FARK: <Agar 0.2s ka bhi farak, hand/posture/action difference, ya camera angle difference mila to EXACT local time aur exact fark likho: e.g. "At 00:04.2 Video 1 me character right hand utha raha hai jabki Video 2 me left hand table par hai — MISMATCH". Agar 100% indisputable frame-accurate identical take hai to likho: "KOI FARK NAHI — 100% identical frame-to-frame micro-actions, posture, and timing">
+
+=====================
+HISSA 2 — FINAL STRICT VERDICTS & JSON
+=====================
+HISSA 1 ke findings ke mutabiq har PART ka STRICT verdict do:
+- Agar HISSA 1 me koi bhi FARK ya timing offset mila -> STRICTLY "REJECTED" (rescanRequired: true).
+- "CONFIRMED" sirf aur sirf tab do jab ZERO FARK mila ho aur visual proof 100% indisputable ho.
+
+Har part ka structured verdict JSON format me provide karo:
 
 \`\`\`json
 {
@@ -113,6 +93,7 @@ Respond with a single valid JSON object containing an array of verdicts for all 
       "partIndex": 1,
       "verdict": "CONFIRMED",
       "confidence": 0.98,
+      "mismatchDetail": "None - exact frame-accurate micro-motion match",
       "cropPosition": "Center 9:16 crop",
       "visualAnchorProof": "At +0.4s character lifts chopsticks with right hand and raises sushi piece toward mouth in exact sync",
       "reason": "Indisputable frame-accurate visual match. All micro-actions, postures, and prop movements align 1:1.",
@@ -122,6 +103,7 @@ Respond with a single valid JSON object containing an array of verdicts for all 
       "partIndex": 2,
       "verdict": "REJECTED",
       "confidence": 0.10,
+      "mismatchDetail": "At 00:06.2 Video 1 actor turns head left, but Video 2 candidate shows character looking straight",
       "cropPosition": "Center crop",
       "visualAnchorProof": "Video 1 character is walking forward; Video 2 candidate shows character standing stationary behind table",
       "reason": "Temporal mismatch trap: candidate is from the same scene but ~12s earlier. Motion and posture do not align.",
@@ -133,4 +115,3 @@ Respond with a single valid JSON object containing an array of verdicts for all 
 
 Provide a verdict for EVERY single PART from 1 to ${parts.length}.`
 }
-

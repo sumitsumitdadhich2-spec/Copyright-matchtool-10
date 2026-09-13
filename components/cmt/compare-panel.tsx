@@ -234,6 +234,37 @@ export function ComparePanel({ scan }: { scan: Scan }) {
     setCandIdx(null)
   }, [idx, pairShortStart])
 
+  // External jump to scene listener (e.g. from Batch Verifier "View" button)
+  useEffect(() => {
+    function handleJumpToScene(e: CustomEvent<{ shortStart?: number; shortEnd?: number; pairIndex?: number }>) {
+      if (typeof e.detail?.pairIndex === 'number' && e.detail.pairIndex >= 0 && e.detail.pairIndex < pairs.length) {
+        setIdx(e.detail.pairIndex)
+        const el = document.getElementById('compare-panel')
+        if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+        return
+      }
+      if (typeof e.detail?.shortStart === 'number') {
+        const targetStart = e.detail.shortStart
+        const targetEnd = e.detail.shortEnd
+        const foundIdx = pairs.findIndex((p) =>
+          (targetEnd !== undefined && sameShortSegment(p.shortStart, p.shortEnd, targetStart, targetEnd)) ||
+          Math.abs(p.shortStart - targetStart) < 0.35 ||
+          (p.shortStart <= targetStart + 0.1 && p.shortEnd >= targetStart - 0.1),
+        )
+        if (foundIdx !== -1) {
+          setIdx(foundIdx)
+          const el = document.getElementById('compare-panel')
+          if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+        }
+      }
+    }
+
+    window.addEventListener('jump-to-compare-scene', handleJumpToScene as EventListener)
+    return () => {
+      window.removeEventListener('jump-to-compare-scene', handleJumpToScene as EventListener)
+    }
+  }, [pairs])
+
   // Safe seek helper to prevent video decode lockup during rapid switching
   const safeSeek = useCallback((video: HTMLVideoElement | null, targetTime: number) => {
     if (!video) return
@@ -803,7 +834,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
   const src = (kind: 'short' | 'movie') => `/api/scans/${scan.id}/media?kind=${kind}`
 
   return (
-    <section aria-label="Side-by-side comparison" className="panel relative">
+    <section id="compare-panel" aria-label="Side-by-side comparison" className="panel relative">
       {/* Top Header Bar */}
       <div className="flex flex-wrap items-center gap-2">
         <SplitSquareHorizontal className="size-4 text-primary" aria-hidden />

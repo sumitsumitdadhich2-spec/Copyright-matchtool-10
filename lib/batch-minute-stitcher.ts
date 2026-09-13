@@ -15,8 +15,64 @@ export interface MinuteSegmentPlan {
 
 /**
  * Plan matched scene segments for a specific 1-minute window of the short video.
- * Gaps (unmatched/missing seconds) are naturally omitted from the plan.
+ * Uses only MAIN matches (candidates excluded). Gaps (unmatched seconds) are omitted.
  */
+export function getMainMatches(matches: ChunkMatch[]): ChunkMatch[] {
+  if (!matches || matches.length === 0) return []
+
+  const sorted = [...matches].sort((a, b) => {
+    if (Math.abs(a.shortStart - b.shortStart) > 0.2) {
+      return a.shortStart - b.shortStart
+    }
+    const aPick = a.userPick ? 1 : 0
+    const bPick = b.userPick ? 1 : 0
+    if (aPick !== bPick) return bPick - aPick
+
+    const aConf = a.verified || a.batchVerified === 'confirmed' ? 1 : 0
+    const bConf = b.verified || b.batchVerified === 'confirmed' ? 1 : 0
+    if (aConf !== bConf) return bConf - aConf
+
+    const aDur = a.shortEnd - a.shortStart
+    const bDur = b.shortEnd - b.shortStart
+    if (Math.abs(aDur - bDur) > 0.1) return bDur - aDur
+
+    return (b.confidence || 0) - (a.confidence || 0)
+  })
+
+  const out: ChunkMatch[] = []
+  for (const m of sorted) {
+    const conflictIndex = out.findIndex((existing) =>
+      sameShortSegment(existing.shortStart, existing.shortEnd, m.shortStart, m.shortEnd),
+    )
+
+    if (conflictIndex === -1) {
+      out.push(m)
+    } else {
+      const existing = out[conflictIndex]
+      const existingPriority =
+        (existing.userPick ? 10000 : 0) +
+        (existing.verified || existing.batchVerified === 'confirmed' ? 1000 : 0) +
+        (existing.rejected || existing.batchVerified === 'rejected' ? -500 : 0) +
+        (existing.shortEnd - existing.shortStart) * 10 +
+        (existing.confidence || 0)
+
+      const mPriority =
+        (m.userPick ? 10000 : 0) +
+        (m.verified || m.batchVerified === 'confirmed' ? 1000 : 0) +
+        (m.rejected || m.batchVerified === 'rejected' ? -500 : 0) +
+        (m.shortEnd - m.shortStart) * 10 +
+        (m.confidence || 0)
+
+      if (mPriority > existingPriority) {
+        out[conflictIndex] = m
+      }
+    }
+  }
+
+  out.sort((a, b) => a.shortStart - b.shortStart)
+  return out
+}
+
 export function planMinuteSegments(scan: Scan, minuteIndex: number): MinuteSegmentPlan {
   const minStart = minuteIndex * 60
   const minEnd = (minuteIndex + 1) * 60
@@ -29,69 +85,26 @@ export function planMinuteSegments(scan: Scan, minuteIndex: number): MinuteSegme
     }
   }
 
-  // All matches that overlap this minute
-  const candidateMatches: ChunkMatch[] = (scan.matches || [])
-    .filter((m) => m.shortStart < minEnd && m.shortEnd > minStart && m.shortEnd - m.shortStart >= 0.15)
+  // Get only MAIN matches — candidate alternatives are completely excluded
+  const mainMatches = getMainMatches(scan.matches || [])
 
-  // Priority scoring function: User pick > Confirmed/Verified > Longer duration > Higher confidence
-  function getMatchPriority(m: ChunkMatch): number {
-    let p = 0
-    if (m.userPick) p += 10000
-    if (m.batchVerified === 'confirmed' || m.verified) p += 1000
-    if (m.rejected || m.batchVerified === 'rejected') p -= 500
-    p += (m.shortEnd - m.shortStart) * 10
-    p += (m.confidence || 0) * 10
-    return p
-  }
-
-  // Sort candidates by priority descending
-  const sortedByPriority = [...candidateMatches].sort((a, b) => getMatchPriority(b) - getMatchPriority(a))
-
-  // Greedily pick non-overlapping candidates that represent the best, authentic scene matches
-  const chosenMatches: ChunkMatch[] = []
-  for (const cand of sortedByPriority) {
-    const cStart = Math.max(minStart, cand.shortStart)
-    const cEnd = Math.min(minEnd, cand.shortEnd)
-    if (cEnd - cStart < 0.15) continue
-
-    // Check if this candidate represents the same scene or significantly overlaps with any already selected candidate
-    const overlaps = chosenMatches.some((chosen) => {
-      if (sameShortSegment(cand.shortStart, cand.shortEnd, chosen.shortStart, chosen.shortEnd)) {
-        return true
-      }
-      const chosenStart = Math.max(minStart, chosen.shortStart)
-      const chosenEnd = Math.min(minEnd, chosen.shortEnd)
-      const oStart = Math.max(cStart, chosenStart)
-      const oEnd = Math.min(cEnd, chosenEnd)
-      const overlapDur = oEnd - oStart
-      const shorter = Math.min(cEnd - cStart, chosenEnd - chosenStart)
-      return (
-        Math.abs(cand.shortStart - chosen.shortStart) < 0.45 ||
-        overlapDur >= 0.15 ||
-        (shorter > 0 && overlapDur / shorter >= 0.15)
-      )
-    })
-
-    if (!overlaps) {
-      chosenMatches.push(cand)
-    }
-  }
-
-  // Sort the chosen non-overlapping matches strictly chronologically by shortStart
-  chosenMatches.sort((a, b) => a.shortStart - b.shortStart)
+  // All main matches that overlap this minute
+  const minuteMatches = mainMatches.filter(
+    (m) => m.shortStart < minEnd && m.shortEnd > minStart && m.shortEnd - m.shortStart >= 0.15,
+  )
 
   const parts: BatchVerifyPart[] = []
   let runningLocalClock = 0
   let lastEnd = minStart
 
-  for (const m of chosenMatches) {
+  for (const m of minuteMatches) {
     const sStart = Math.max(minStart, m.shortStart)
     const sEnd = Math.min(minEnd, m.shortEnd)
 
     // Skip tiny slices < 0.15s or inverted ranges
     if (sEnd - sStart < 0.15) continue
 
-    // Only adjust for tiny edge jitter (< 0.2s) between consecutive non-conflicting scenes
+    // Adjust for any small edge overlap with previous scene
     const adjustedStart = Math.max(sStart, lastEnd)
     if (sEnd - adjustedStart < 0.15) continue
 
@@ -181,6 +194,7 @@ export async function stitchMinuteVerificationClips(
 
 /**
  * Internal helper to stitch multiple time segments from a source file into a single 24 FPS MP4.
+ * Guarantees zero frame drift and sample-locked audio sync.
  */
 async function stitchSourceParts(
   sourceFile: string,
@@ -194,16 +208,23 @@ async function stitchSourceParts(
   const vFilters: string[] = []
   const aFilters: string[] = []
   const vLabels: string[] = []
-  const aLabels: string[] = []
+
+  let totalFrames = 0
 
   segments.forEach((seg, i) => {
-    inArgs.push('-fflags', '+genpts', '-ss', seg.start.toFixed(3), '-t', seg.dur.toFixed(3), '-i', sourceFile)
-    vFilters.push(`[${i}:v]scale=640:-2,fps=24,setsar=1[v${i}]`)
+    const frames = Math.max(1, Math.round(seg.dur * 24))
+    totalFrames += frames
+    const samples = frames * 2000 // 48000 Hz / 24 fps = exactly 2000 samples per frame
+    const readDur = seg.dur + 0.25 // slight read buffer to ensure trim=end_frame always has enough input
+
+    inArgs.push('-accurate_seek', '-ss', seg.start.toFixed(3), '-t', readDur.toFixed(3), '-i', sourceFile)
+    vFilters.push(`[${i}:v]scale=640:-2,fps=24,trim=end_frame=${frames},setpts=PTS-STARTPTS,setsar=1[v${i}]`)
     vLabels.push(`[v${i}]`)
 
     if (hasAudio) {
-      aFilters.push(`[${i}:a]aresample=48000:async=1,aformat=channel_layouts=mono[a${i}]`)
-      aLabels.push(`[a${i}]`)
+      aFilters.push(
+        `[${i}:a]asetpts=PTS-STARTPTS,aresample=48000:async=0:first_pts=0,aformat=channel_layouts=mono,apad=whole_len=${samples},atrim=end_sample=${samples},asetpts=N/SR/TB[a${i}]`,
+      )
     }
   })
 
@@ -246,12 +267,18 @@ async function stitchSourceParts(
   }
 
   outArgs.push(
+    '-frames:v',
+    String(totalFrames),
+    '-r',
+    '24',
     '-c:v',
     'libx264',
     '-preset',
     'veryfast',
     '-crf',
-    '28',
+    '26',
+    '-bf',
+    '0',
     '-pix_fmt',
     'yuv420p',
     '-fps_mode',
@@ -263,5 +290,5 @@ async function stitchSourceParts(
     outFile,
   )
 
-  await runFfmpeg(outArgs, { label: `stitch ${label} (${segments.length} segments)`, token })
+  await runFfmpeg(outArgs, { label: `stitch ${label} (${segments.length} segments, ${totalFrames} frames)`, token })
 }

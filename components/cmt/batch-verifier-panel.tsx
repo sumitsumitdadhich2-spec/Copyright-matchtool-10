@@ -5,6 +5,7 @@ import { useSWRConfig } from 'swr'
 import {
   CheckCircle2,
   AlertCircle,
+  Eye,
   Loader2,
   RotateCcw,
   ChevronDown,
@@ -19,6 +20,17 @@ import { displayModelName } from '@/lib/models'
 
 export function BatchVerifierPanel({ scan }: { scan: Scan }) {
   const { mutate } = useSWRConfig()
+
+  const jumpToCompare = (shortStart: number, shortEnd: number) => {
+    window.dispatchEvent(
+      new CustomEvent('jump-to-compare-scene', {
+        detail: { shortStart, shortEnd },
+      }),
+    )
+    const el = document.getElementById('compare-panel')
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
+
   const [expandedMinutes, setExpandedMinutes] = useState<Record<number, boolean>>({ 0: true })
   const [triggeringMinute, setTriggeringMinute] = useState<number | null>(null)
   const [triggeringAll, setTriggeringAll] = useState(false)
@@ -407,9 +419,20 @@ export function BatchVerifierPanel({ scan }: { scan: Scan }) {
                                 {isRejected && (
                                   <span className="inline-flex items-center gap-1 rounded bg-rose-500/20 px-2 py-0.5 text-[10px] font-medium text-rose-400 border border-rose-500/30">
                                     <AlertCircle className="h-3 w-3" />
-                                    REJECTED (Rescan Required)
+                                    REJECTED
                                   </span>
                                 )}
+
+                                {/* View button to jump directly to Side-by-Side Comparison */}
+                                <button
+                                  type="button"
+                                  onClick={() => jumpToCompare(p.shortStart, p.shortEnd)}
+                                  className="inline-flex items-center gap-1 rounded bg-secondary hover:bg-secondary/80 border border-border/80 px-2 py-0.5 text-[10px] font-medium text-foreground transition-colors cursor-pointer shadow-xs hover:border-primary/50"
+                                  title={`View Short [${fmtTime(p.shortStart)}–${fmtTime(p.shortEnd)}] in Side-by-Side Comparison`}
+                                >
+                                  <Eye className="h-3 w-3 text-primary" />
+                                  View
+                                </button>
 
                                 {isRejected && (
                                   <div className="relative">
@@ -535,12 +558,23 @@ export function BatchVerifierPanel({ scan }: { scan: Scan }) {
                           key={i}
                           className="flex items-center justify-between rounded border border-border/40 bg-background/30 px-2.5 py-1.5 text-[11px]"
                         >
-                          <span className="font-mono text-muted-foreground">
-                            Short {fmtTime(m.shortStart)}–{fmtTime(m.shortEnd)} ⟷ Movie {fmtTime(m.movieStart)}–{fmtTime(m.movieEnd)}
-                          </span>
-                          <span className="text-muted-foreground">
-                            {(m.shortEnd - m.shortStart).toFixed(2)}s
-                          </span>
+                          <div className="flex items-center gap-2">
+                            <span className="font-mono text-muted-foreground">
+                              Short {fmtTime(m.shortStart)}–{fmtTime(m.shortEnd)} ⟷ Movie {fmtTime(m.movieStart)}–{fmtTime(m.movieEnd)}
+                            </span>
+                            <span className="text-muted-foreground">
+                              ({(m.shortEnd - m.shortStart).toFixed(2)}s)
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => jumpToCompare(m.shortStart, m.shortEnd)}
+                            className="inline-flex items-center gap-1 rounded bg-secondary hover:bg-secondary/80 border border-border/80 px-2 py-0.5 text-[10px] font-medium text-foreground transition-colors cursor-pointer shadow-xs hover:border-primary/50"
+                            title="View in Side-by-Side Comparison"
+                          >
+                            <Eye className="h-3 w-3 text-primary" />
+                            View
+                          </button>
                         </div>
                       ))}
                     </div>
