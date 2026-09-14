@@ -13,9 +13,11 @@ import {
   Plus,
   Trash2,
   Check,
+  Eye,
 } from 'lucide-react'
 import type { MissingSceneScanState, MissingSceneTarget, Scan } from '@/lib/types'
 import { fetcher, fmtTime } from '@/lib/format'
+import { CandidateSideBySide } from './candidate-side-by-side'
 
 interface MissingSceneApiResponse {
   ok: boolean
@@ -33,6 +35,7 @@ export function MissingScenePanel({ scan }: { scan: Scan }) {
   const [actionLoading, setActionLoading] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
   const [reviewingId, setReviewingId] = useState<string | null>(null)
+  const [selectedCandidateId, setSelectedCandidateId] = useState<string | null>(null)
 
   const { data, mutate } = useSWR<MissingSceneApiResponse>(
     scan.id ? `/api/scans/${scan.id}/missing-scene-scan` : null,
@@ -459,37 +462,58 @@ export function MissingScenePanel({ scan }: { scan: Scan }) {
             </div>
           )}
 
-          {/* CANDIDATE SCENE MATCHES FOR USER MANUAL REVIEW */}
+          {/* CANDIDATE SCENE MATCHES FOR USER MANUAL REVIEW WITH SIDE-BY-SIDE VIDEO PREVIEW */}
           {state.candidates && state.candidates.length > 0 && (
             <div className="mt-3 border-t border-border/60 pt-2.5">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-semibold text-foreground">
                   <Sparkles className="mr-1 inline size-3.5 text-primary" aria-hidden />
-                  Candidate Scene Matches ({state.candidates.length}) — Manual Review:
+                  Candidate Scene Matches ({state.candidates.length}) — Side-by-Side Review:
                 </span>
                 <span className="text-[11px] text-muted-foreground">
-                  (Check and click Accept to add match or Reject)
+                  (Watch synchronized video preview below, then click Accept or Reject)
                 </span>
               </div>
-              <div className="mt-2 space-y-2">
-                {state.candidates.map((cand) => {
+
+              {/* SIDE-BY-SIDE DUAL VIDEO PLAYER */}
+              <CandidateSideBySide
+                scan={scan}
+                candidates={state.candidates}
+                selectedCandidateId={selectedCandidateId || state.candidates[0]?.id || null}
+                onSelectCandidate={(id) => setSelectedCandidateId(id)}
+                onAccept={(id) => handleReviewCandidate(id, 'accept')}
+                onReject={(id) => handleReviewCandidate(id, 'reject')}
+                reviewingId={reviewingId}
+              />
+
+              {/* CANDIDATE LIST */}
+              <div className="mt-3 space-y-2">
+                <div className="text-[11px] font-medium text-muted-foreground">
+                  All Candidates List (Click any candidate to preview in player above):
+                </div>
+                {state.candidates.map((cand, idx) => {
                   const isAccepted = cand.status === 'confirmed'
                   const isRejected = cand.status === 'rejected'
                   const isBusy = reviewingId === cand.id
+                  const isSelected = (selectedCandidateId || state.candidates?.[0]?.id) === cand.id
 
                   return (
                     <div
                       key={cand.id}
-                      className={`flex flex-wrap items-center justify-between gap-2 rounded-lg border p-2.5 text-xs transition-colors ${
-                        isAccepted
+                      onClick={() => setSelectedCandidateId(cand.id)}
+                      className={`flex flex-wrap items-center justify-between gap-2 rounded-lg border p-2.5 text-xs transition-all cursor-pointer ${
+                        isSelected
+                          ? 'border-primary ring-1 ring-primary bg-primary/10 shadow-xs'
+                          : isAccepted
                           ? 'border-success/40 bg-success/10'
                           : isRejected
                           ? 'border-muted bg-muted/20 opacity-60'
-                          : 'border-primary/30 bg-primary/5'
+                          : 'border-primary/30 bg-primary/5 hover:border-primary/60'
                       }`}
                     >
                       <div className="space-y-0.5">
                         <div className="flex items-center gap-2">
+                          <span className="font-semibold text-primary">#{idx + 1}</span>
                           <span className="font-mono font-medium text-foreground">
                             Short {fmtTime(cand.shortStart)}–{fmtTime(cand.shortEnd)}
                           </span>
@@ -500,6 +524,11 @@ export function MissingScenePanel({ scan }: { scan: Scan }) {
                           <span className="rounded bg-secondary px-1.5 py-0.5 text-[10px] text-muted-foreground">
                             Chunk {cand.chunkIndex + 1}
                           </span>
+                          {isSelected && (
+                            <span className="flex items-center gap-1 rounded bg-primary/20 px-1.5 py-0.5 text-[10px] font-semibold text-primary">
+                              <Eye className="size-3" /> PREVIEWING
+                            </span>
+                          )}
                         </div>
                         {cand.model && (
                           <p className="text-[11px] text-muted-foreground">
@@ -508,7 +537,7 @@ export function MissingScenePanel({ scan }: { scan: Scan }) {
                         )}
                       </div>
 
-                      <div className="flex items-center gap-1.5">
+                      <div className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
                         {isAccepted ? (
                           <span className="flex items-center gap-1 rounded-md bg-success/20 px-2 py-1 text-xs font-medium text-success">
                             <Check className="size-3.5" aria-hidden />
@@ -524,7 +553,7 @@ export function MissingScenePanel({ scan }: { scan: Scan }) {
                               type="button"
                               onClick={() => handleReviewCandidate(cand.id, 'accept')}
                               disabled={isBusy || actionLoading}
-                              className="btn-press flex items-center gap-1 rounded-md bg-success px-2.5 py-1 text-xs font-semibold text-success-foreground hover:bg-success/90 disabled:opacity-40"
+                              className="btn-press flex items-center gap-1 rounded-md bg-success px-2.5 py-1 text-xs font-semibold text-success-foreground hover:bg-success/90 disabled:opacity-40 cursor-pointer"
                             >
                               {isBusy ? <Loader2 className="size-3 animate-spin" aria-hidden /> : <Check className="size-3" aria-hidden />}
                               Accept Match
@@ -533,7 +562,7 @@ export function MissingScenePanel({ scan }: { scan: Scan }) {
                               type="button"
                               onClick={() => handleReviewCandidate(cand.id, 'reject')}
                               disabled={isBusy || actionLoading}
-                              className="btn-press rounded-md border border-input bg-card px-2 py-1 text-xs text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
+                              className="btn-press rounded-md border border-input bg-card px-2 py-1 text-xs text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-40 cursor-pointer"
                             >
                               Reject
                             </button>

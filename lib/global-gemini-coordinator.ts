@@ -447,12 +447,6 @@ class GlobalGeminiCoordinator {
         other.cooldownUntil = Math.max(other.cooldownUntil, now + cooldownMs)
       }
     }
-    // Also give a short safety breathing room (5s) to any other models on this same API key
-    for (const other of this.lanes.values()) {
-      if (other.keyHash === kh) {
-        other.cooldownUntil = Math.max(other.cooldownUntil, now + 5000)
-      }
-    }
   }
 
   /** Report that a model's daily quota has been exhausted across the entire app */
