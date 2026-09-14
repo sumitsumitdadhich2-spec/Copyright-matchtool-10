@@ -156,11 +156,11 @@ class Scheduler {
       }
     }, 30_000)
 
-    // Periodic Gemini Storage Cleanup every 15 minutes: sweeps old orphaned files (>2 hours) from Gemini Files API
+    // Periodic Gemini Storage Cleanup every 15 minutes: sweeps old orphaned files (>24 hours) from Gemini Files API
     setInterval(() => {
       for (const [, job] of this.jobs.entries()) {
         for (const lane of job.lanes) {
-          void cleanupOrphanedGeminiFiles(lane.apiKey, 2 * 60 * 60_000)
+          void cleanupOrphanedGeminiFiles(lane.apiKey, 24 * 60 * 60_000)
         }
       }
     }, 15 * 60_000)
@@ -299,9 +299,9 @@ class Scheduler {
       )
     }
 
-    // Proactive Storage Sweep: clean any orphaned Gemini files older than 2 hours to prevent hitting the 20 GB cap
+    // Proactive Storage Sweep: clean any orphaned Gemini files older than 24 hours to preserve cache for 24h
     for (const k of apiKeys) {
-      void cleanupOrphanedGeminiFiles(k, 2 * 60 * 60_000)
+      void cleanupOrphanedGeminiFiles(k, 24 * 60 * 60_000)
     }
 
     if (!Array.isArray(scan.matches)) scan.matches = []
@@ -2203,7 +2203,7 @@ class Scheduler {
       }
       lane.chunkUploads.clear()
       // Background sweep on this lane's API key to keep storage clean
-      void cleanupOrphanedGeminiFiles(lane.apiKey, 2 * 60 * 60_000)
+      void cleanupOrphanedGeminiFiles(lane.apiKey, 24 * 60 * 60_000)
     }
     if (job.saverTimer) clearInterval(job.saverTimer)
     saveScan(job.scan)

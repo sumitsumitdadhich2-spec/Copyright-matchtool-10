@@ -7,6 +7,7 @@ import {
   isMissingSceneScannerRunning,
   startMissingSceneScanner,
   stopMissingSceneScanner,
+  reviewMissingSceneCandidate,
 } from '@/lib/missing-scene-scanner'
 
 export const runtime = 'nodejs'
@@ -36,12 +37,21 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
   const { id } = await ctx.params
   const body = (await req.json().catch(() => ({}))) as {
+    action?: 'accept' | 'reject'
+    candidateId?: string
     scenes?: Array<{ start: number; end: number; id?: string }>
     windowIndices?: number[]
   }
 
-  const scan = await getFreshScan(id)
+  const scan = isMissingSceneScannerRunning(id) ? getScan(id) : await getFreshScan(id)
   if (!scan) return NextResponse.json({ error: 'Scan not found' }, { status: 404 })
+
+  // If action is accept or reject for a candidate
+  if (body.action && body.candidateId) {
+    const res = reviewMissingSceneCandidate(scan, body.candidateId, body.action)
+    if (!res.ok) return NextResponse.json({ error: res.error }, { status: 400 })
+    return NextResponse.json({ ok: true, state: scan.missingSceneScan, matches: scan.matches })
+  }
 
   const keys = await getAllUserApiKeys(session.username)
   if (keys.length === 0) {

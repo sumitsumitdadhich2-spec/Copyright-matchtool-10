@@ -137,7 +137,7 @@ export function startGapBackup(
     addLog(scan, 'success', `[Daily Quota Reset] New date detected (${geminiUsageDay()}) — all Gemini daily quotas reset to fresh state.`)
   }
   for (const k of apiKeys) {
-    void cleanupOrphanedGeminiFiles(k, 2 * 60 * 60_000)
+    void cleanupOrphanedGeminiFiles(k, 24 * 60 * 60_000)
   }
   const allGaps = uncovered(scan)
   if (!allGaps.length) return { ok: false, error: 'No true uncovered ranges remain' }

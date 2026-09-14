@@ -491,6 +491,15 @@ export interface GeminiPrescanWindow {
   policyRetried?: boolean
 }
 
+export interface GeminiUploadProgressInfo {
+  bytesUploaded: number
+  totalBytes: number
+  pct: number
+  speedStr: string
+  stage: 'uploading' | 'processing' | 'done' | 'idle' | 'error'
+  error?: string
+}
+
 export interface GeminiPrescanUpload {
   shortUri: string
   shortName: string
@@ -500,6 +509,8 @@ export interface GeminiPrescanUpload {
   /** Muted/sanitized short video upload URI used for policy-blocked window retries */
   sanitizedShortUri?: string
   sanitizedShortName?: string
+  movieProgress?: GeminiUploadProgressInfo
+  shortProgress?: GeminiUploadProgressInfo
 }
 
 /** One PART of the backup clip = one missing short range (already padded ±2 s). */

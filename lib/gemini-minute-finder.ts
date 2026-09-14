@@ -24,6 +24,7 @@ import {
   GeminiError,
   type MinuteFinderParse,
   type BackupPartSpec,
+  type UploadProgress,
 } from './gemini'
 import { applyApprovedMinutes } from './minute-ranges'
 import { mergeRanges, missingRanges as sharedMissingRanges } from './short-coverage'
@@ -70,8 +71,8 @@ export const MINUTE_FINDER_WINDOW_SEC = 1200
 export const MINUTE_FINDER_MAX_SHORT_SEC = 180
 /** Gemini files live 48 h — reuse uploads for 47 h. */
 const UPLOAD_TTL_MS = 47 * 60 * 60 * 1000
-/** Strict attempt cap of 7 per window: stops infinite retry loops if a window fails repeatedly. */
-const MAX_WINDOW_ATTEMPTS = 7
+/** Strict attempt cap of 6 per window: stops infinite retry loops if a window fails repeatedly. */
+const MAX_WINDOW_ATTEMPTS = 6
 /** How long to wait for movie chunking to finish before the chunk scan can start. */
 const CHUNKING_WAIT_MS = 45 * 60_000
 /** BACKUP pass: every gap is padded on both sides (short-side timestamps are ±2 s approx). */
@@ -235,8 +236,8 @@ export function startGeminiMinuteFinder(
     state.windows = []
     state.minuteSuggestions = undefined
     state.backup = undefined
-    // Proactive storage sweep on start: clean any orphaned files older than 2 hours
-    void cleanupOrphanedGeminiFiles(userApiKeys[0], 2 * 60 * 60_000)
+    // Proactive storage sweep on start: clean any orphaned files older than 24 hours
+    void cleanupOrphanedGeminiFiles(userApiKeys[0], 24 * 60 * 60_000)
 
     for (const k of Object.keys(state.uploads)) {
       const u = state.uploads[k]
@@ -520,14 +521,15 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
   const validKeysWithQuota = sortedKeys.filter((k) => k.totalRemaining > 0)
   const pool = validKeysWithQuota.length > 0 ? validKeysWithQuota : sortedKeys
 
-  // STRICT RULE: Upload to at least 3 keys in parallel (if pool has >= 3 keys) so window scan is fast across multiple keys
-  const targetActiveKeys = Math.min(pool.length, Math.max(3, Math.min(6, Math.ceil(total / 2))))
+  // 2 keys are plenty (2 keys × 3 models = 6 parallel workers).
+  // Once 2 keys are uploaded, immediately start running the window minute finder without wasting time!
+  const targetActiveKeys = Math.min(pool.length, 2)
 
   persist(id, ctrl, { status: 'uploading', progress: `Uploading to Gemini (0/${targetActiveKeys} keys)...` })
   
   const lanesByKey: typeof pool = []
   let keyCursor = 0
-  const UPLOAD_CONCURRENCY = Math.min(targetActiveKeys, 4)
+  const UPLOAD_CONCURRENCY = Math.min(targetActiveKeys, 2)
 
   // Worker pool pulls candidate keys from the sorted pool until targetActiveKeys are uploaded
   // (minimum 3 keys if available). If any key upload fails, it seamlessly tries the next key from the pool!
@@ -714,20 +716,60 @@ async function ensureUploads(
         movieUri: reusedMovie.uri,
         movieName: reusedMovie.name,
         uploadedAt: reusedMovie.uploadedAt || Date.now(),
+        movieProgress: { bytesUploaded: 1, totalBytes: 1, pct: 100, speedStr: 'Cached (0s reuse)', stage: 'done' },
+        shortProgress: { bytesUploaded: 1, totalBytes: 1, pct: 100, speedStr: 'Cached (0s reuse)', stage: 'done' },
       }
       persist(id, ctrl)
     }
     log(id, 'info', `Key ${keyIdx}: uploads cached (short + movie copy) — skip`)
     return ctrl.state.uploads[keyId]
   }
+
   // Upload short first, then movie copy sequentially per key to prevent socket / 500 congestion
-  const s = shortOk ? { uri: cached!.shortUri, name: cached!.shortName } : await uploadVideo(ai, shortFile)
+  const onShortProgress = (p: UploadProgress) => {
+    const existing = ctrl.state.uploads[keyId] || ({} as GeminiPrescanUpload)
+    ctrl.state.uploads[keyId] = {
+      ...existing,
+      shortProgress: {
+        bytesUploaded: p.bytesUploaded,
+        totalBytes: p.totalBytes,
+        pct: p.pct,
+        speedStr: p.speedStr,
+        stage: p.stage,
+      },
+    }
+    persist(id, ctrl, {
+      progress: `Key ${keyIdx}: Short upload ${p.pct}% (${(p.bytesUploaded / (1024 * 1024)).toFixed(1)} / ${(p.totalBytes / (1024 * 1024)).toFixed(1)} MB @ ${p.speedStr})`,
+    })
+  }
+
+  const onMovieProgress = (p: UploadProgress) => {
+    const existing = ctrl.state.uploads[keyId] || ({} as GeminiPrescanUpload)
+    ctrl.state.uploads[keyId] = {
+      ...existing,
+      movieProgress: {
+        bytesUploaded: p.bytesUploaded,
+        totalBytes: p.totalBytes,
+        pct: p.pct,
+        speedStr: p.speedStr,
+        stage: p.stage,
+      },
+    }
+    persist(id, ctrl, {
+      progress: `Key ${keyIdx}: Movie copy upload ${p.pct}% (${(p.bytesUploaded / (1024 * 1024)).toFixed(1)} / ${(p.totalBytes / (1024 * 1024)).toFixed(1)} MB @ ${p.speedStr})`,
+    })
+  }
+
+  const s = shortOk
+    ? { uri: cached!.shortUri, name: cached!.shortName }
+    : await uploadVideo(ai, shortFile, onShortProgress, () => ctrl.stopping)
+
   const m =
     movieOk && reusedMovie
       ? { uri: reusedMovie.uri, name: reusedMovie.name }
       : movieOk
         ? { uri: cached!.movieUri, name: cached!.movieName }
-        : await uploadVideo(ai, copyPath)
+        : await uploadVideo(ai, copyPath, onMovieProgress, () => ctrl.stopping)
 
   const up: GeminiPrescanUpload = {
     shortUri: s.uri,
@@ -735,6 +777,8 @@ async function ensureUploads(
     movieUri: m.uri,
     movieName: m.name,
     uploadedAt: Date.now(),
+    movieProgress: { bytesUploaded: 1, totalBytes: 1, pct: 100, speedStr: 'ACTIVE', stage: 'done' },
+    shortProgress: { bytesUploaded: 1, totalBytes: 1, pct: 100, speedStr: 'ACTIVE', stage: 'done' },
   }
   ctrl.state.uploads[keyId] = up
   persist(id, ctrl)

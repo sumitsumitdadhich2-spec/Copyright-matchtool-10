@@ -281,6 +281,64 @@ export function MinuteFinderPanel({ scan, mode, onModeChanged }: { scan: Scan; m
             </p>
           )}
 
+          {/* KEY UPLOADS PROGRESS DETAILS */}
+          {prescan.uploads && Object.keys(prescan.uploads).length > 0 && (status === 'uploading' || isActive) && (
+            <div className="mt-2.5 space-y-1.5 rounded-lg border border-border/70 bg-card/60 p-2.5">
+              <div className="flex items-center justify-between text-[11px] font-medium text-foreground">
+                <span>Gemini Files API Uploads:</span>
+                <span className="text-muted-foreground">24h cache persistence</span>
+              </div>
+              <div className="grid gap-2 sm:grid-cols-2">
+                {Object.entries(prescan.uploads).map(([keyId, up], idx) => {
+                  const mProg = up.movieProgress
+                  const sProg = up.shortProgress
+                  return (
+                    <div key={keyId} className="rounded-md border border-border/50 bg-background/50 p-2 text-xs">
+                      <div className="flex items-center justify-between font-mono text-[11px] font-medium text-foreground">
+                        <span>Key {idx + 1} ({keyId.slice(0, 8)})</span>
+                        <span className="text-[10px] text-primary">
+                          {mProg?.pct === 100 && sProg?.pct === 100 ? 'READY' : 'UPLOADING'}
+                        </span>
+                      </div>
+                      
+                      {/* Movie upload bar */}
+                      <div className="mt-1.5 space-y-0.5">
+                        <div className="flex justify-between text-[10px] text-muted-foreground">
+                          <span>Movie Copy</span>
+                          <span className="font-mono">
+                            {mProg ? `${mProg.pct}% · ${mProg.speedStr}` : up.movieUri ? '100% (Ready)' : 'Waiting...'}
+                          </span>
+                        </div>
+                        <div className="h-1.5 w-full overflow-hidden rounded-full bg-secondary">
+                          <div
+                            className="h-full bg-primary transition-all duration-300"
+                            style={{ width: `${mProg ? mProg.pct : up.movieUri ? 100 : 0}%` }}
+                          />
+                        </div>
+                      </div>
+
+                      {/* Short upload bar */}
+                      <div className="mt-1.5 space-y-0.5">
+                        <div className="flex justify-between text-[10px] text-muted-foreground">
+                          <span>Short Video</span>
+                          <span className="font-mono">
+                            {sProg ? `${sProg.pct}% · ${sProg.speedStr}` : up.shortUri ? '100% (Ready)' : 'Waiting...'}
+                          </span>
+                        </div>
+                        <div className="h-1.5 w-full overflow-hidden rounded-full bg-secondary">
+                          <div
+                            className="h-full bg-success transition-all duration-300"
+                            style={{ width: `${sProg ? sProg.pct : up.shortUri ? 100 : 0}%` }}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
           {/* MOVIE COPY INFO */}
           {prescan.movieCopy && (
             <p className="mt-2 text-xs text-muted-foreground">

@@ -6,13 +6,12 @@ import {
   getClient,
   uploadVideo,
   deleteFileQuiet,
-  verifyRequest,
-  parseVerdict,
   classifyError,
   CHUNK_MAP_SANITIZED_PROMPT,
+  type UploadProgress,
 } from './gemini'
-import { CHUNK_MODEL_POOL, VERIFY_MODEL_POOL } from './models'
-import { buildBackupClip, chunkPath, extractClipPrecise, sanitizeVideoMute } from './ffmpeg'
+import { CHUNK_MODEL_POOL } from './models'
+import { buildBackupClip, chunkPath, extractClipPrecise, sanitizeVideoMute, preparePrescanMovieCopy } from './ffmpeg'
 import { localMediaPath, findAndReusePrescanMovie, findReusableGeminiMovieUpload, findAndReuseMovieChunks } from './media'
 import { addLog, getScan, saveScan, scanMediaDir, incrementModelUsage, apiKeyHash } from './store'
 import { gapsOf, mergeRanges } from './short-coverage'
@@ -204,7 +203,11 @@ async function runMissingSceneScanner(
     // 2. Upload missing scene clip to Gemini Files API
     state.progress = 'Uploading missing scene clip to Gemini...'
     saveScan(scan)
-    const clipUpload = await uploadVideo(ai, clipOutFile)
+    const onClipProgress = (p: UploadProgress) => {
+      state.progress = `Uploading missing scene clip (${p.pct}% @ ${p.speedStr})...`
+      saveScan(scan)
+    }
+    const clipUpload = await uploadVideo(ai, clipOutFile, onClipProgress, () => ctrl.stopping)
     uploadedFilesToClean.push(clipUpload.name)
 
     // 3. Ensure movie copy is available
@@ -214,8 +217,10 @@ async function runMissingSceneScanner(
       if (reused) {
         movieCopyPath = reused.copyPath
       } else {
-        // Fallback: use movieFile if no copy
-        movieCopyPath = movieFile
+        state.progress = 'Preparing optimized movie copy for Gemini window scan...'
+        saveScan(scan)
+        const prep = await preparePrescanMovieCopy(movieFile, mediaDir, trimStart, trimEnd)
+        movieCopyPath = prep.path
       }
     }
 
@@ -234,10 +239,15 @@ async function runMissingSceneScanner(
       )
       if (reusableUpload) {
         movieUploadUri = reusableUpload.movieUri
+        addLog(scan, 'info', `[Missing Scene Finder] Reusing existing movie copy upload on Gemini Files API`)
       } else {
         state.progress = 'Uploading movie copy to Gemini Files API...'
         saveScan(scan)
-        const up = await uploadVideo(ai, movieCopyPath)
+        const onMovieProgress = (p: UploadProgress) => {
+          state.progress = `Uploading movie copy (${p.pct}% @ ${p.speedStr})...`
+          saveScan(scan)
+        }
+        const up = await uploadVideo(ai, movieCopyPath, onMovieProgress, () => ctrl.stopping)
         movieUploadUri = up.uri
         uploadedFilesToClean.push(up.name)
       }
@@ -673,128 +683,17 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
 
     if (ctrl.stopping) return
 
-    // 6. 24 FPS Verification for all candidates
-    if (candidates.length > 0) {
-      state.status = 'verifying'
-      state.progress = `Verifying ${candidates.length} candidate match(es) at 24 fps...`
-      saveScan(scan)
-      addLog(scan, 'info', `[Missing Scene Finder] Starting 24 fps frame-by-frame verification for ${candidates.length} candidate(s)...`)
-
-      for (const cand of candidates) {
-        if (ctrl.stopping) break
-
-        cand.status = 'verifying'
-        saveScan(scan)
-
-        const vShortClip = path.join(mediaDir, `verify-short-${cand.id}.mp4`)
-        const vMovieClip = path.join(mediaDir, `verify-movie-${cand.id}.mp4`)
-
-        try {
-          // Cut short and movie clips precisely at 24 fps
-          await extractClipPrecise(shortFile, cand.shortStart, cand.shortEnd, vShortClip)
-          await extractClipPrecise(movieFile, cand.movieStart, cand.movieEnd, vMovieClip)
-
-          const upShort = await uploadVideo(ai, vShortClip)
-          const upMovie = await uploadVideo(ai, vMovieClip)
-          uploadedFilesToClean.push(upShort.name, upMovie.name)
-
-          const clipSec = Math.max(cand.shortEnd - cand.shortStart, cand.movieEnd - cand.movieStart, 5)
-          let releaseVLock: ((sec?: number) => void) | null = null
-          try {
-            const activeKeys = apiKeys && apiKeys.length > 0 ? apiKeys : [primaryApiKey]
-            const candLanes = activeKeys.flatMap((k: string, ki: number) =>
-              VERIFY_MODEL_POOL.map((m) => ({
-                apiKey: k,
-                keyIdx: ki + 1,
-                modelId: m.id,
-                rpd: m.rpd,
-              })),
-            )
-
-            const { selected, release } = await globalGeminiCoordinator.acquireFirstAvailableLane({
-              scanId,
-              scanTitle: scan.shortName || scanId,
-              candidates: candLanes,
-              operation: `Missing Scene Verify Short ${fmtTime(cand.shortStart)}`,
-              videoSeconds: clipSec,
-              onWait: (msg) => addLog(scan, 'info', msg),
-              isStopping: () => ctrl.stopping,
-            })
-            releaseVLock = release
-
-            const runnerAi = selected.apiKey === primaryApiKey ? ai : getClient(selected.apiKey)
-            const vResp = await verifyRequest(runnerAi, selected.modelId, upShort.uri, upMovie.uri)
-            const verdict = parseVerdict(vResp)
-
-            cand.verifierModel = selected.modelId
-            cand.verifierReason = verdict?.reason || ''
-            cand.verified = verdict?.same === true
-
-            if (verdict?.same) {
-              cand.status = 'confirmed'
-              const confirmedMatch: ChunkMatch = {
-                chunkIndex: cand.chunkIndex,
-                shortStart: cand.shortStart,
-                shortEnd: cand.shortEnd,
-                movieStart: cand.movieStart,
-                movieEnd: cand.movieEnd,
-                reason: `Targeted missing scene verified at 24 fps (${cand.verifierReason})`,
-                model: cand.model,
-                verified: true,
-                verifierModel: selected.modelId,
-                verifierReason: cand.verifierReason,
-                origin: 'gap-backup',
-              }
-
-              // Merge into scan.matches
-              if (!Array.isArray(scan.matches)) scan.matches = []
-              scan.matches = [...scan.matches.filter((m) => !(m.shortStart >= cand.shortStart && m.shortEnd <= cand.shortEnd)), confirmedMatch]
-              scan.matches.sort((a, b) => a.shortStart - b.shortStart)
-
-              state.addedMatches = state.addedMatches || []
-              state.addedMatches.push(confirmedMatch)
-
-              saveScan(scan)
-              addLog(
-                scan,
-                'success',
-                `[Missing Scene Finder] 24 FPS VERIFIED SAME! Short ${fmtTime(cand.shortStart)}–${fmtTime(cand.shortEnd)} matches Movie ${fmtTime(cand.movieStart)}–${fmtTime(cand.movieEnd)}!`,
-              )
-            } else {
-              cand.status = 'rejected'
-              saveScan(scan)
-              addLog(
-                scan,
-                'info',
-                `[Missing Scene Finder] 24 FPS Verifier: DIFFERENT for candidate ${fmtTime(cand.shortStart)}–${fmtTime(cand.shortEnd)} (${cand.verifierReason})`,
-              )
-            }
-          } finally {
-            if (releaseVLock) releaseVLock(clipSec)
-          }
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err)
-          cand.status = 'rejected'
-          cand.verifierReason = msg.slice(0, 100)
-          saveScan(scan)
-          addLog(scan, 'warn', `[Missing Scene Finder] Verification failed for candidate: ${msg.slice(0, 100)}`)
-        } finally {
-          try {
-            if (fs.existsSync(/*turbopackIgnore: true*/ vShortClip)) fs.unlinkSync(vShortClip)
-            if (fs.existsSync(/*turbopackIgnore: true*/ vMovieClip)) fs.unlinkSync(vMovieClip)
-          } catch {}
-        }
-      }
-    }
-
+    // 6. Finish scan - manual user review (verifier removed as requested)
     state.status = 'done'
-    state.progress = `Missing scene scan completed! ${state.addedMatches?.length || 0} match(es) verified & added to results.`
+    state.progress = candidates.length > 0
+      ? `Scan finished! ${candidates.length} candidate match(es) found — review and accept/reject below.`
+      : `Scan finished! No matching scenes found in the selected windows.`
     state.finishedAt = Date.now()
     saveScan(scan)
     addLog(
       scan,
       'success',
-      `[Missing Scene Finder] Scan finished! Added ${state.addedMatches?.length || 0} confirmed 24 fps match(es).`,
+      `[Missing Scene Finder] Scan finished! Found ${candidates.length} candidate scene match(es) for manual review.`,
     )
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
@@ -808,5 +707,77 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
     for (const name of uploadedFilesToClean) {
       void deleteFileQuiet(ai, name).catch(() => {})
     }
+  }
+}
+
+/**
+ * Review (Accept or Reject) a candidate match found by the Missing Scene Scanner.
+ */
+export function reviewMissingSceneCandidate(
+  scan: Scan,
+  candidateId: string,
+  action: 'accept' | 'reject',
+): { ok: boolean; error?: string } {
+  if (!scan.missingSceneScan || !Array.isArray(scan.missingSceneScan.candidates)) {
+    return { ok: false, error: 'No missing scene candidates in this scan' }
+  }
+  const cand = scan.missingSceneScan.candidates.find((c) => c.id === candidateId)
+  if (!cand) return { ok: false, error: 'Candidate not found' }
+
+  if (action === 'accept') {
+    cand.status = 'confirmed'
+    cand.verified = true
+    const confirmedMatch: ChunkMatch = {
+      chunkIndex: cand.chunkIndex,
+      shortStart: cand.shortStart,
+      shortEnd: cand.shortEnd,
+      movieStart: cand.movieStart,
+      movieEnd: cand.movieEnd,
+      reason: `Missing scene candidate accepted by user (${cand.model})`,
+      model: cand.model,
+      verified: true,
+      origin: 'gap-backup',
+    }
+
+    // Merge into scan.matches (deduplicate overlapping ranges)
+    if (!Array.isArray(scan.matches)) scan.matches = []
+    scan.matches = [
+      ...scan.matches.filter((m) => !(m.shortStart >= cand.shortStart && m.shortEnd <= cand.shortEnd)),
+      confirmedMatch,
+    ]
+    scan.matches.sort((a, b) => a.shortStart - b.shortStart)
+
+    scan.missingSceneScan.addedMatches = scan.missingSceneScan.addedMatches || []
+    if (!scan.missingSceneScan.addedMatches.some((m) => m.shortStart === cand.shortStart && m.movieStart === cand.movieStart)) {
+      scan.missingSceneScan.addedMatches.push(confirmedMatch)
+    }
+
+    saveScan(scan)
+    addLog(
+      scan,
+      'success',
+      `[Missing Scene Finder] User ACCEPTED candidate: Short ${fmtTime(cand.shortStart)}–${fmtTime(cand.shortEnd)} matches Movie ${fmtTime(cand.movieStart)}–${fmtTime(cand.movieEnd)}!`,
+    )
+    return { ok: true }
+  } else {
+    cand.status = 'rejected'
+    cand.verified = false
+    if (Array.isArray(scan.matches)) {
+      scan.matches = scan.matches.filter(
+        (m) => !(m.shortStart === cand.shortStart && m.movieStart === cand.movieStart),
+      )
+    }
+    if (Array.isArray(scan.missingSceneScan.addedMatches)) {
+      scan.missingSceneScan.addedMatches = scan.missingSceneScan.addedMatches.filter(
+        (m) => !(m.shortStart === cand.shortStart && m.movieStart === cand.movieStart),
+      )
+    }
+    saveScan(scan)
+    addLog(
+      scan,
+      'info',
+      `[Missing Scene Finder] User REJECTED candidate: Short ${fmtTime(cand.shortStart)}–${fmtTime(cand.shortEnd)}`,
+    )
+    return { ok: true }
   }
 }

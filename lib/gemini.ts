@@ -1,3 +1,5 @@
+import fs from 'fs'
+import path from 'path'
 import { GoogleGenAI, ThinkingLevel, HarmCategory, HarmBlockThreshold } from '@google/genai'
 import { SCAN_FPS, MAX_OUTPUT_TOKENS } from './models'
 import type { ChunkMatch } from './types'
@@ -152,12 +154,188 @@ export function extractResponseText(resp: GeminiResponseLike | unknown): string 
   return extractResponseDetails(resp).text
 }
 
+const clientApiKeys = new WeakMap<GoogleGenAI, string>()
+
 export function getClient(apiKey: string): GoogleGenAI {
-  return new GoogleGenAI({ apiKey, httpOptions: { timeout: 600_000 } })
+  const client = new GoogleGenAI({ apiKey, httpOptions: { timeout: 600_000 } })
+  clientApiKeys.set(client, apiKey)
+  return client
+}
+
+export function getApiKeyFromClient(ai: GoogleGenAI): string | undefined {
+  return clientApiKeys.get(ai) || (ai as unknown as { apiKey?: string }).apiKey
+}
+
+export interface UploadProgress {
+  bytesUploaded: number
+  totalBytes: number
+  pct: number
+  speedBps: number
+  speedStr: string
+  stage: 'uploading' | 'processing' | 'done'
+}
+
+async function uploadResumableWithProgress(
+  apiKey: string,
+  filePath: string,
+  ai: GoogleGenAI,
+  onProgress?: (p: UploadProgress) => void,
+  isStopping?: () => boolean,
+): Promise<{ uri: string; name: string }> {
+  const stat = await fs.promises.stat(filePath)
+  const fileSize = stat.size
+  const fileName = path.basename(filePath)
+
+  // 1. Initiate resumable upload session
+  const initRes = await fetch(
+    `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${encodeURIComponent(apiKey)}`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Upload-Protocol': 'resumable',
+        'X-Goog-Upload-Command': 'start',
+        'X-Goog-Upload-Header-Content-Length': String(fileSize),
+        'X-Goog-Upload-Header-Content-Type': 'video/mp4',
+        'X-Goog-Upload-File-Name': fileName,
+      },
+      body: JSON.stringify({
+        file: { displayName: fileName },
+      }),
+    },
+  )
+
+  if (!initRes.ok) {
+    const txt = await initRes.text().catch(() => '')
+    throw new Error(`Failed to initiate Gemini resumable upload (${initRes.status}): ${txt.slice(0, 160)}`)
+  }
+
+  const uploadUrl = initRes.headers.get('x-goog-upload-url')
+  if (!uploadUrl) {
+    throw new Error('Gemini API did not return x-goog-upload-url in headers')
+  }
+
+  // 2. Stream chunks (8 MB chunks) with accurate byte & speed tracking
+  const CHUNK_SIZE = 8 * 1024 * 1024
+  let offset = 0
+  const startTime = Date.now()
+  const fd = await fs.promises.open(filePath, 'r')
+  let finalJson: { file?: { name?: string; uri?: string } } | null = null
+
+  try {
+    while (offset < fileSize) {
+      if (isStopping && isStopping()) throw new Error('Upload cancelled')
+      const chunkSize = Math.min(CHUNK_SIZE, fileSize - offset)
+      const isFinal = offset + chunkSize >= fileSize
+      const buffer = Buffer.alloc(chunkSize)
+      const { bytesRead } = await fd.read(buffer, 0, chunkSize, offset)
+      if (bytesRead !== chunkSize) {
+        throw new Error(`Read mismatch: expected ${chunkSize} bytes, got ${bytesRead}`)
+      }
+
+      let chunkRes: Response | null = null
+      for (let attempt = 1; attempt <= 4; attempt++) {
+        if (isStopping && isStopping()) throw new Error('Upload cancelled')
+        try {
+          chunkRes = await fetch(uploadUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Length': String(chunkSize),
+              'X-Goog-Upload-Offset': String(offset),
+              'X-Goog-Upload-Command': isFinal ? 'upload, finalize' : 'upload',
+            },
+            body: buffer,
+          })
+          if (chunkRes.ok) break
+          if (attempt === 4) {
+            const errTxt = await chunkRes.text().catch(() => '')
+            throw new Error(`Chunk upload failed (${chunkRes.status}): ${errTxt.slice(0, 140)}`)
+          }
+        } catch (e) {
+          if (attempt === 4) throw e
+          await new Promise((r) => setTimeout(r, 1200 * attempt))
+        }
+      }
+
+      offset += chunkSize
+      const elapsedSec = Math.max(0.1, (Date.now() - startTime) / 1000)
+      const speedBps = offset / elapsedSec
+      const speedStr = (speedBps / (1024 * 1024)).toFixed(1) + ' MB/s'
+      const pct = Math.min(100, Math.round((offset / fileSize) * 100))
+
+      onProgress?.({
+        bytesUploaded: offset,
+        totalBytes: fileSize,
+        pct,
+        speedBps,
+        speedStr,
+        stage: isFinal ? 'processing' : 'uploading',
+      })
+
+      if (isFinal && chunkRes) {
+        finalJson = (await chunkRes.json().catch(() => null)) as { file?: { name?: string; uri?: string } }
+      }
+    }
+  } finally {
+    await fd.close()
+  }
+
+  const uploadedFileName = finalJson?.file?.name
+  if (!uploadedFileName) {
+    throw new Error('Gemini did not return uploaded file name')
+  }
+
+  // 3. Poll for ACTIVE state with a 20-minute deadline and resilient error handling
+  let f = await ai.files.get({ name: uploadedFileName })
+  const deadline = Date.now() + 20 * 60_000
+
+  while (f.state === 'PROCESSING') {
+    if (isStopping && isStopping()) throw new Error('Upload cancelled')
+    if (Date.now() > deadline) {
+      throw new GeminiError('other', 'File processing timed out (20 min exceeded)')
+    }
+    await new Promise((r) => setTimeout(r, 2500))
+    try {
+      f = await ai.files.get({ name: f.name! })
+    } catch {
+      // transient network blip, continue polling
+    }
+  }
+
+  if (f.state !== 'ACTIVE') {
+    const errObj = (f as { error?: { message?: string; code?: number } }).error
+    const detail = errObj?.message ? ` (${errObj.message})` : ''
+    throw new GeminiError('other', `File upload failed (state=${f.state}${detail})`)
+  }
+
+  onProgress?.({
+    bytesUploaded: fileSize,
+    totalBytes: fileSize,
+    pct: 100,
+    speedBps: 0,
+    speedStr: 'ACTIVE',
+    stage: 'done',
+  })
+
+  return { uri: f.uri!, name: f.name! }
 }
 
 /** Upload a local video file to the Gemini Files API and wait until it is ACTIVE. */
-export async function uploadVideo(ai: GoogleGenAI, filePath: string): Promise<{ uri: string; name: string }> {
+export async function uploadVideo(
+  ai: GoogleGenAI,
+  filePath: string,
+  onProgress?: (p: UploadProgress) => void,
+  isStopping?: () => boolean,
+): Promise<{ uri: string; name: string }> {
+  const apiKey = getApiKeyFromClient(ai) || process.env.GEMINI_API_KEY
+  if (apiKey) {
+    try {
+      return await uploadResumableWithProgress(apiKey, filePath, ai, onProgress, isStopping)
+    } catch (err) {
+      console.warn('Resumable upload failed, falling back to ai.files.upload:', err)
+    }
+  }
+
   let file: Awaited<ReturnType<typeof ai.files.upload>> | undefined
   let lastErr: unknown
   for (let attempt = 1; attempt <= 2; attempt++) {
@@ -184,12 +362,17 @@ export async function uploadVideo(ai: GoogleGenAI, filePath: string): Promise<{ 
   if (!file) throw lastErr || new GeminiError('other', 'Upload failed without response')
 
   let f = file
-  const deadline = Date.now() + 5 * 60_000
-  // FAST POLLING: check every 2s so the pipeline moves the moment the file is ACTIVE.
+  const deadline = Date.now() + 20 * 60_000
+  // FAST POLLING with 20m deadline: check every 2.5s until ACTIVE
   while (f.state === 'PROCESSING') {
-    if (Date.now() > deadline) throw new GeminiError('other', 'File processing timed out')
-    await new Promise((r) => setTimeout(r, 2000))
-    f = await ai.files.get({ name: f.name! })
+    if (isStopping && isStopping()) throw new Error('Stopped')
+    if (Date.now() > deadline) throw new GeminiError('other', 'File processing timed out (20 min exceeded)')
+    await new Promise((r) => setTimeout(r, 2500))
+    try {
+      f = await ai.files.get({ name: f.name! })
+    } catch {
+      // transient network blip
+    }
   }
   if (f.state !== 'ACTIVE') {
     const errObj = (f as { error?: { message?: string; code?: number } }).error
@@ -209,11 +392,11 @@ export async function deleteFileQuiet(ai: GoogleGenAI, name: string) {
 
 /**
  * Sweeps the Gemini Files API for the provided key and removes any uploaded clips
- * that are older than `olderThanMs` (default 2 hours) to prevent hitting the 20 GB storage cap.
+ * that are older than `olderThanMs` (default 24 hours) to preserve cache for 24h.
  */
 export async function cleanupOrphanedGeminiFiles(
   apiKey: string,
-  olderThanMs: number = 2 * 60 * 60_000,
+  olderThanMs: number = 24 * 60 * 60_000,
 ): Promise<{ deleted: number; total: number }> {
   try {
     const ai = getClient(apiKey)

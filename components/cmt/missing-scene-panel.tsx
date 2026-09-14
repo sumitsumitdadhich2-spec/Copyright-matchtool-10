@@ -32,6 +32,7 @@ export function MissingScenePanel({ scan }: { scan: Scan }) {
   const [customError, setCustomError] = useState<string | null>(null)
   const [actionLoading, setActionLoading] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
+  const [reviewingId, setReviewingId] = useState<string | null>(null)
 
   const { data, mutate } = useSWR<MissingSceneApiResponse>(
     scan.id ? `/api/scans/${scan.id}/missing-scene-scan` : null,
@@ -43,6 +44,27 @@ export function MissingScenePanel({ scan }: { scan: Scan }) {
 
   const state = data?.state || scan.missingSceneScan
   const isRunning = Boolean(data?.running || (state && ['preparing', 'scanning_windows', 'scanning_chunks', 'verifying'].includes(state.status)))
+
+  const handleReviewCandidate = async (candidateId: string, action: 'accept' | 'reject') => {
+    setReviewingId(candidateId)
+    try {
+      const res = await fetch(`/api/scans/${scan.id}/missing-scene-scan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, candidateId }),
+      })
+      const result = await res.json()
+      if (!res.ok) {
+        setActionError(result.error || 'Review candidate failed')
+      } else {
+        await mutate()
+      }
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setReviewingId(null)
+    }
+  }
 
   // Available scenes: server detected gaps + user added custom scenes
   const detectedGaps = data?.detectedGaps || []
@@ -367,12 +389,100 @@ export function MissingScenePanel({ scan }: { scan: Scan }) {
             </div>
           )}
 
-          {/* VERIFIED MATCHES */}
+          {/* CANDIDATE SCENE MATCHES FOR USER MANUAL REVIEW */}
+          {state.candidates && state.candidates.length > 0 && (
+            <div className="mt-3 border-t border-border/60 pt-2.5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-foreground">
+                  <Sparkles className="mr-1 inline size-3.5 text-primary" aria-hidden />
+                  Candidate Scene Matches ({state.candidates.length}) — Manual Review:
+                </span>
+                <span className="text-[11px] text-muted-foreground">
+                  (Check and click Accept to add match or Reject)
+                </span>
+              </div>
+              <div className="mt-2 space-y-2">
+                {state.candidates.map((cand) => {
+                  const isAccepted = cand.status === 'confirmed'
+                  const isRejected = cand.status === 'rejected'
+                  const isBusy = reviewingId === cand.id
+
+                  return (
+                    <div
+                      key={cand.id}
+                      className={`flex flex-wrap items-center justify-between gap-2 rounded-lg border p-2.5 text-xs transition-colors ${
+                        isAccepted
+                          ? 'border-success/40 bg-success/10'
+                          : isRejected
+                          ? 'border-muted bg-muted/20 opacity-60'
+                          : 'border-primary/30 bg-primary/5'
+                      }`}
+                    >
+                      <div className="space-y-0.5">
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono font-medium text-foreground">
+                            Short {fmtTime(cand.shortStart)}–{fmtTime(cand.shortEnd)}
+                          </span>
+                          <span className="text-muted-foreground">➔</span>
+                          <span className="font-mono font-medium text-foreground">
+                            Movie {fmtTime(cand.movieStart)}–{fmtTime(cand.movieEnd)}
+                          </span>
+                          <span className="rounded bg-secondary px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                            Chunk {cand.chunkIndex + 1}
+                          </span>
+                        </div>
+                        {cand.model && (
+                          <p className="text-[11px] text-muted-foreground">
+                            Model: <span className="font-mono">{cand.model}</span>
+                          </p>
+                        )}
+                      </div>
+
+                      <div className="flex items-center gap-1.5">
+                        {isAccepted ? (
+                          <span className="flex items-center gap-1 rounded-md bg-success/20 px-2 py-1 text-xs font-medium text-success">
+                            <Check className="size-3.5" aria-hidden />
+                            Accepted
+                          </span>
+                        ) : isRejected ? (
+                          <span className="rounded-md bg-muted px-2 py-1 text-xs text-muted-foreground">
+                            Rejected
+                          </span>
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => handleReviewCandidate(cand.id, 'accept')}
+                              disabled={isBusy || actionLoading}
+                              className="btn-press flex items-center gap-1 rounded-md bg-success px-2.5 py-1 text-xs font-semibold text-success-foreground hover:bg-success/90 disabled:opacity-40"
+                            >
+                              {isBusy ? <Loader2 className="size-3 animate-spin" aria-hidden /> : <Check className="size-3" aria-hidden />}
+                              Accept Match
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleReviewCandidate(cand.id, 'reject')}
+                              disabled={isBusy || actionLoading}
+                              className="btn-press rounded-md border border-input bg-card px-2 py-1 text-xs text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
+                            >
+                              Reject
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* CONFIRMED MATCHES SUMMARY */}
           {state.addedMatches && state.addedMatches.length > 0 && (
             <div className="mt-2.5 border-t border-border/60 pt-2">
               <span className="text-[11px] font-medium text-success">
                 <Check className="mr-1 inline size-3" aria-hidden />
-                24 FPS Confirmed Matches Added ({state.addedMatches.length}):
+                Confirmed Matches Added to Scan ({state.addedMatches.length}):
               </span>
               <div className="mt-1 space-y-1">
                 {state.addedMatches.map((m, i) => (
@@ -384,7 +494,7 @@ export function MissingScenePanel({ scan }: { scan: Scan }) {
                       Short {fmtTime(m.shortStart)}–{fmtTime(m.shortEnd)} ➔ Movie {fmtTime(m.movieStart)}–{fmtTime(m.movieEnd)}
                     </span>
                     <span className="rounded-full bg-success/20 px-2 py-0.5 text-[10px] font-semibold text-success">
-                      24 FPS VERIFIED
+                      CONFIRMED
                     </span>
                   </div>
                 ))}
