@@ -3,7 +3,7 @@ import path from 'node:path'
 import { MEDIA_DIR, WORK_DIR } from './paths'
 import { runFfmpeg, CancelToken } from './ffmpeg-pool'
 import { probeHasAudio } from './ffmpeg'
-import { sameShortSegment } from './candidate-pick'
+import { resolveMainMatches } from './candidate-pick'
 import type { Scan, BatchVerifyPart, ChunkMatch } from './types'
 
 export interface MinuteSegmentPlan {
@@ -18,59 +18,7 @@ export interface MinuteSegmentPlan {
  * Uses only MAIN matches (candidates excluded). Gaps (unmatched seconds) are omitted.
  */
 export function getMainMatches(matches: ChunkMatch[]): ChunkMatch[] {
-  if (!matches || matches.length === 0) return []
-
-  const sorted = [...matches].sort((a, b) => {
-    if (Math.abs(a.shortStart - b.shortStart) > 0.2) {
-      return a.shortStart - b.shortStart
-    }
-    const aPick = a.userPick ? 1 : 0
-    const bPick = b.userPick ? 1 : 0
-    if (aPick !== bPick) return bPick - aPick
-
-    const aConf = a.verified || a.batchVerified === 'confirmed' ? 1 : 0
-    const bConf = b.verified || b.batchVerified === 'confirmed' ? 1 : 0
-    if (aConf !== bConf) return bConf - aConf
-
-    const aDur = a.shortEnd - a.shortStart
-    const bDur = b.shortEnd - b.shortStart
-    if (Math.abs(aDur - bDur) > 0.1) return bDur - aDur
-
-    return (b.confidence || 0) - (a.confidence || 0)
-  })
-
-  const out: ChunkMatch[] = []
-  for (const m of sorted) {
-    const conflictIndex = out.findIndex((existing) =>
-      sameShortSegment(existing.shortStart, existing.shortEnd, m.shortStart, m.shortEnd),
-    )
-
-    if (conflictIndex === -1) {
-      out.push(m)
-    } else {
-      const existing = out[conflictIndex]
-      const existingPriority =
-        (existing.userPick ? 10000 : 0) +
-        (existing.verified || existing.batchVerified === 'confirmed' ? 1000 : 0) +
-        (existing.rejected || existing.batchVerified === 'rejected' ? -500 : 0) +
-        (existing.shortEnd - existing.shortStart) * 10 +
-        (existing.confidence || 0)
-
-      const mPriority =
-        (m.userPick ? 10000 : 0) +
-        (m.verified || m.batchVerified === 'confirmed' ? 1000 : 0) +
-        (m.rejected || m.batchVerified === 'rejected' ? -500 : 0) +
-        (m.shortEnd - m.shortStart) * 10 +
-        (m.confidence || 0)
-
-      if (mPriority > existingPriority) {
-        out[conflictIndex] = m
-      }
-    }
-  }
-
-  out.sort((a, b) => a.shortStart - b.shortStart)
-  return out
+  return resolveMainMatches(matches)
 }
 
 export function planMinuteSegments(scan: Scan, minuteIndex: number): MinuteSegmentPlan {

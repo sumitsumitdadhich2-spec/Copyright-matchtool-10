@@ -20,12 +20,14 @@ import {
   Sparkles,
   SplitSquareHorizontal,
   Terminal,
+  Volume2,
+  VolumeX,
   X,
 } from 'lucide-react'
-import type { Scan, ChunkMatch } from '@/lib/types'
+import type { Scan } from '@/lib/types'
 import { fmtTime } from '@/lib/format'
 import { displayModelName } from '@/lib/models'
-import { candidateOptionsFor, hasAlternatives, sameShortSegment } from '@/lib/candidate-pick'
+import { candidateOptionsFor, hasAlternatives, sameShortSegment, resolveMainMatches } from '@/lib/candidate-pick'
 import { CandidateChooser } from './candidate-chooser'
 
 interface RescanLogEntry {
@@ -103,63 +105,7 @@ function playRescanChime() {
 export function ComparePanel({ scan }: { scan: Scan }) {
   const { mutate } = useSWRConfig()
   const pairs = useMemo(() => {
-    const raw = scan.matches || []
-    if (raw.length === 0) return []
-
-    // 1. Sort raw by shortStart, with deterministic priority for conflicts:
-    // User pick > Confirmed / Verified > Longer duration > Higher confidence
-    const sorted = [...raw].sort((a, b) => {
-      if (Math.abs(a.shortStart - b.shortStart) > 0.2) {
-        return a.shortStart - b.shortStart
-      }
-      const aPick = a.userPick ? 1 : 0
-      const bPick = b.userPick ? 1 : 0
-      if (aPick !== bPick) return bPick - aPick
-
-      const aConf = (a.verified || a.batchVerified === 'confirmed') ? 1 : 0
-      const bConf = (b.verified || b.batchVerified === 'confirmed') ? 1 : 0
-      if (aConf !== bConf) return bConf - aConf
-
-      const aDur = a.shortEnd - a.shortStart
-      const bDur = b.shortEnd - b.shortStart
-      if (Math.abs(aDur - bDur) > 0.1) return bDur - aDur
-
-      return (b.confidence || 0) - (a.confidence || 0)
-    })
-
-    // 2. Build non-overlapping pairs list.
-    const out: ChunkMatch[] = []
-    for (const m of sorted) {
-      const conflictIndex = out.findIndex((existing) =>
-        sameShortSegment(existing.shortStart, existing.shortEnd, m.shortStart, m.shortEnd),
-      )
-
-      if (conflictIndex === -1) {
-        out.push(m)
-      } else {
-        const existing = out[conflictIndex]
-        const existingPriority =
-          (existing.userPick ? 10000 : 0) +
-          ((existing.verified || existing.batchVerified === 'confirmed') ? 1000 : 0) +
-          (existing.rejected || existing.batchVerified === 'rejected' ? -500 : 0) +
-          (existing.shortEnd - existing.shortStart) * 10 +
-          (existing.confidence || 0)
-
-        const mPriority =
-          (m.userPick ? 10000 : 0) +
-          ((m.verified || m.batchVerified === 'confirmed') ? 1000 : 0) +
-          (m.rejected || m.batchVerified === 'rejected' ? -500 : 0) +
-          (m.shortEnd - m.shortStart) * 10 +
-          (m.confidence || 0)
-
-        if (mPriority > existingPriority) {
-          out[conflictIndex] = m
-        }
-      }
-    }
-
-    out.sort((a, b) => a.shortStart - b.shortStart)
-    return out
+    return resolveMainMatches(scan.matches || [])
   }, [scan.matches])
 
   const [idx, setIdx] = useState(0)
@@ -190,6 +136,13 @@ export function ComparePanel({ scan }: { scan: Scan }) {
   const playbackRateRef = useRef(1)
   playbackRateRef.current = playbackRate
   const pendingAutoPlayRef = useRef(false)
+  const [audioTrack, setAudioTrack] = useState<'none' | 'short' | 'movie'>('none')
+
+  // Stability & Self-healing Watchdog tracking
+  const lastFingerprintRef = useRef<string>('')
+  const sceneStartTimeRef = useRef<number>(0)
+  const lastProgressCheckRef = useRef<{ shortTime: number; movieTime: number; timestamp: number } | null>(null)
+  const firstEndedRef = useRef<{ who: 'short' | 'movie'; timestamp: number } | null>(null)
 
   const pair = pairs[Math.min(idx, Math.max(0, pairs.length - 1))]
   const pairShortStart = pair?.shortStart ?? 0
@@ -300,13 +253,26 @@ export function ComparePanel({ scan }: { scan: Scan }) {
 
     sv.playbackRate = playbackRateRef.current
     mv.playbackRate = playbackRateRef.current
+    sv.muted = audioTrack !== 'short'
+    mv.muted = audioTrack !== 'movie'
+
+    firstEndedRef.current = null
+    sceneStartTimeRef.current = Date.now()
 
     const p1 = sv.play().catch(() => {})
     const p2 = mv.play().catch(() => {})
     void Promise.all([p1, p2]).then(() => {
       setPlaying(true)
     })
-  }, [pair, shortStart, shortEnd, movieStart, movieEnd])
+  }, [pair, shortStart, shortEnd, movieStart, movieEnd, audioTrack])
+
+  // Reactively apply audio track mute states to existing video DOM instances
+  useEffect(() => {
+    const sv = shortRef.current
+    const mv = movieRef.current
+    if (sv) sv.muted = audioTrack !== 'short'
+    if (mv) mv.muted = audioTrack !== 'movie'
+  }, [audioTrack])
 
   // Pause playback cleanly and stop autoplay
   const pauseBoth = useCallback(() => {
@@ -316,11 +282,22 @@ export function ComparePanel({ scan }: { scan: Scan }) {
     if (mv) mv.pause()
     setPlaying(false)
     pendingAutoPlayRef.current = false
+    firstEndedRef.current = null
   }, [])
 
   // Seek both players to window start whenever shown windows change
   useEffect(() => {
     if (!pair) return
+
+    const fingerprint = `${idx}:${candIdx ?? 'main'}:${shortStart.toFixed(2)}:${movieStart.toFixed(2)}`
+
+    // CRITICAL: Prevent SWR poll data refresh from resetting active playback!
+    // If the scene coordinates haven't changed, do not disrupt current playback.
+    if (lastFingerprintRef.current === fingerprint) {
+      return
+    }
+    lastFingerprintRef.current = fingerprint
+
     isSeekingRef.current = true
     if (animFrameRef.current) {
       cancelAnimationFrame(animFrameRef.current)
@@ -334,17 +311,48 @@ export function ComparePanel({ scan }: { scan: Scan }) {
     if (shortBarRef.current) shortBarRef.current.style.width = '0%'
     if (movieBarRef.current) movieBarRef.current.style.width = '0%'
 
+    firstEndedRef.current = null
+
     if (pendingAutoPlayRef.current && autoplayRef.current) {
       pendingAutoPlayRef.current = false
-      const timer = setTimeout(() => {
+
+      // Synchronization barrier: wait for both videos to decode their seeked frames (or max 280ms)
+      let settled = false
+      const proceed = () => {
+        if (settled) return
+        settled = true
         startPlayback()
-      }, 120)
-      return () => clearTimeout(timer)
+      }
+
+      const timer = setTimeout(proceed, 280)
+
+      const checkReady = () => {
+        const sReady = !sv || (!sv.seeking && sv.readyState >= 2)
+        const mReady = !mv || (!mv.seeking && mv.readyState >= 2)
+        if (sReady && mReady) {
+          clearTimeout(timer)
+          proceed()
+        }
+      }
+
+      if (sv) {
+        sv.addEventListener('seeked', checkReady, { once: true })
+        sv.addEventListener('canplay', checkReady, { once: true })
+      }
+      if (mv) {
+        mv.addEventListener('seeked', checkReady, { once: true })
+        mv.addEventListener('canplay', checkReady, { once: true })
+      }
+      checkReady()
+
+      return () => {
+        clearTimeout(timer)
+      }
     } else {
       setPlaying(false)
     }
     isSeekingRef.current = false
-  }, [pair, pairShortStart, movieStart, candIdx, safeSeek, shortStart, startPlayback])
+  }, [idx, candIdx, shortStart, movieStart, pair, safeSeek, startPlayback])
 
   // High-frequency synchronized frame loop during playback (No React state re-render = 60fps smooth)
   useEffect(() => {
@@ -375,7 +383,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
           shortBarRef.current.style.width = `${pct}%`
         }
 
-        if (cur >= shortEnd - 0.03) {
+        if (cur >= shortEnd - 0.04) {
           sv.pause()
           sv.currentTime = shortEnd
           shortEnded = true
@@ -394,7 +402,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
           movieBarRef.current.style.width = `${pct}%`
         }
 
-        if (cur >= movieEnd - 0.03) {
+        if (cur >= movieEnd - 0.04) {
           mv.pause()
           mv.currentTime = movieEnd
           movieEnded = true
@@ -405,7 +413,18 @@ export function ComparePanel({ scan }: { scan: Scan }) {
         movieEnded = true
       }
 
-      // Micro-drift correction without choppy seeks (only when playing actively and not seeking)
+      // Record when one video reaches the cut earlier than the other
+      if (shortEnded && !movieEnded) {
+        if (!firstEndedRef.current) {
+          firstEndedRef.current = { who: 'short', timestamp: Date.now() }
+        }
+      } else if (movieEnded && !shortEnded) {
+        if (!firstEndedRef.current) {
+          firstEndedRef.current = { who: 'movie', timestamp: Date.now() }
+        }
+      }
+
+      // Micro-drift correction without choppy seeks (only when both actively playing)
       if (sv && mv && !sv.paused && !mv.paused && !shortEnded && !movieEnded && !sv.seeking && !mv.seeking) {
         const relShort = (sv.currentTime - shortStart) / shortDur
         const relMovie = (mv.currentTime - movieStart) / movieDur
@@ -423,8 +442,15 @@ export function ComparePanel({ scan }: { scan: Scan }) {
         }
       }
 
-      // When BOTH videos have reached their respective cuts:
-      if (shortEnded && movieEnded) {
+      // Robust clip completion detection:
+      // Prevents hang if one video stalls near boundary or finishes slightly sooner
+      const firstEndedDuration = firstEndedRef.current ? Date.now() - firstEndedRef.current.timestamp : 0
+      const clipFinished =
+        (shortEnded && movieEnded) ||
+        (shortEnded && (mv ? mv.currentTime >= movieEnd - 0.15 || mv.paused || firstEndedDuration > 600 : true)) ||
+        (movieEnded && (sv ? sv.currentTime >= shortEnd - 0.15 || sv.paused || firstEndedDuration > 600 : true))
+
+      if (clipFinished) {
         if (autoplayRef.current) {
           pendingAutoPlayRef.current = true
           setIdx((cur) => (cur + 1) % pairs.length)
@@ -447,6 +473,91 @@ export function ComparePanel({ scan }: { scan: Scan }) {
       }
     }
   }, [playing, pair, shortStart, shortEnd, movieStart, movieEnd, shortDur, movieDur, pairs.length])
+
+  // 1-Second Watchdog / Self-Healing Heartbeat ("refresh hota he har 1 sec me taki atke nhi")
+  // Automatically detects decoder stalls, frozen frames, or hanging playback and self-heals
+  useEffect(() => {
+    const watchdog = setInterval(() => {
+      if (!playing && !autoplayRef.current) return
+      const sv = shortRef.current
+      const mv = movieRef.current
+      if (!sv || !mv || !pair) return
+
+      const now = Date.now()
+      const speed = playbackRateRef.current || 1
+      const maxSceneDuration = Math.max(shortDur, movieDur) / speed
+
+      // 1. Scene Max Duration Timeout Guard:
+      // If a scene runs longer than its video duration + 2.2 seconds, automatically advance!
+      if (sceneStartTimeRef.current > 0) {
+        const elapsedSec = (now - sceneStartTimeRef.current) / 1000
+        if (elapsedSec > maxSceneDuration + 2.2) {
+          if (autoplayRef.current) {
+            pendingAutoPlayRef.current = true
+            setIdx((cur) => (cur + 1) % pairs.length)
+            return
+          } else {
+            pauseBoth()
+            return
+          }
+        }
+      }
+
+      // 2. Playback Stall & Unexpected Pause Auto-Recovery:
+      if (playing) {
+        const curShort = sv.currentTime
+        const curMovie = mv.currentTime
+        const shortNearEnd = curShort >= shortEnd - 0.15
+        const movieNearEnd = curMovie >= movieEnd - 0.15
+
+        // If both videos reached or passed near-end, advance
+        if (shortNearEnd && movieNearEnd) {
+          if (autoplayRef.current) {
+            pendingAutoPlayRef.current = true
+            setIdx((cur) => (cur + 1) % pairs.length)
+            return
+          }
+        }
+
+        // If either video was paused unexpectedly in mid-scene, kickstart it!
+        if (sv.paused && !shortNearEnd && !sv.seeking) {
+          void sv.play().catch(() => {})
+        }
+        if (mv.paused && !movieNearEnd && !mv.seeking) {
+          void mv.play().catch(() => {})
+        }
+
+        // Progress check: compare with position 1s ago to detect decode freeze
+        const lastCheck = lastProgressCheckRef.current
+        if (lastCheck) {
+          const svDelta = Math.abs(curShort - lastCheck.shortTime)
+          const mvDelta = Math.abs(curMovie - lastCheck.movieTime)
+
+          // If neither video moved by more than 0.03s in the last second while supposed to be playing
+          if (svDelta < 0.03 && mvDelta < 0.03 && now - lastCheck.timestamp >= 1000) {
+            if (shortNearEnd || movieNearEnd) {
+              if (autoplayRef.current) {
+                pendingAutoPlayRef.current = true
+                setIdx((cur) => (cur + 1) % pairs.length)
+                return
+              }
+            } else {
+              void sv.play().catch(() => {})
+              void mv.play().catch(() => {})
+            }
+          }
+        }
+
+        lastProgressCheckRef.current = {
+          shortTime: curShort,
+          movieTime: curMovie,
+          timestamp: now,
+        }
+      }
+    }, 1000)
+
+    return () => clearInterval(watchdog)
+  }, [playing, pair, shortDur, movieDur, shortEnd, movieEnd, pairs.length, pauseBoth])
 
   const togglePlay = useCallback(() => {
     if (playing) {
@@ -1118,10 +1229,16 @@ export function ComparePanel({ scan }: { scan: Scan }) {
               ref={shortRef}
               src={src('short')}
               preload="metadata"
-              muted
+              muted={audioTrack !== 'short'}
               playsInline
               onLoadedMetadata={() => {
                 if (shortRef.current) safeSeek(shortRef.current, shortStart)
+              }}
+              onWaiting={() => {
+                // If waiting for buffer during playback, keep smooth state
+              }}
+              onError={() => {
+                // Caught and handled safely by 1-second watchdog
               }}
               className="aspect-video w-full object-contain"
             />
@@ -1158,10 +1275,16 @@ export function ComparePanel({ scan }: { scan: Scan }) {
               ref={movieRef}
               src={src('movie')}
               preload="metadata"
-              muted
+              muted={audioTrack !== 'movie'}
               playsInline
               onLoadedMetadata={() => {
                 if (movieRef.current) safeSeek(movieRef.current, movieStart)
+              }}
+              onWaiting={() => {
+                // If waiting for buffer during playback, keep smooth state
+              }}
+              onError={() => {
+                // Caught and handled safely by 1-second watchdog
               }}
               className="aspect-video w-full object-contain"
             />
@@ -1306,6 +1429,46 @@ export function ComparePanel({ scan }: { scan: Scan }) {
               {spd}x
             </button>
           ))}
+        </div>
+
+        {/* Audio Track Selector */}
+        <div className="flex items-center rounded-md border border-input bg-card/70 p-0.5 text-xs">
+          <button
+            type="button"
+            onClick={() => setAudioTrack('none')}
+            className={`flex items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors cursor-pointer ${
+              audioTrack === 'none'
+                ? 'bg-secondary text-foreground font-semibold shadow-xs'
+                : 'text-muted-foreground hover:text-foreground'
+            }`}
+            title="Mute both (safest for continuous autoplay)"
+          >
+            <VolumeX className="size-3" aria-hidden /> Mute
+          </button>
+          <button
+            type="button"
+            onClick={() => setAudioTrack('short')}
+            className={`flex items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors cursor-pointer ${
+              audioTrack === 'short'
+                ? 'bg-primary text-primary-foreground font-semibold shadow-xs'
+                : 'text-muted-foreground hover:text-foreground'
+            }`}
+            title="Listen to Short audio"
+          >
+            <Volume2 className="size-3" aria-hidden /> Short Audio
+          </button>
+          <button
+            type="button"
+            onClick={() => setAudioTrack('movie')}
+            className={`flex items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors cursor-pointer ${
+              audioTrack === 'movie'
+                ? 'bg-primary text-primary-foreground font-semibold shadow-xs'
+                : 'text-muted-foreground hover:text-foreground'
+            }`}
+            title="Listen to Movie audio"
+          >
+            <Volume2 className="size-3" aria-hidden /> Movie Audio
+          </button>
         </div>
 
         {/* Restart Match Playback */}

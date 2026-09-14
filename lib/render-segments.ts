@@ -1,4 +1,7 @@
 import type { MatchOrigin, Scan } from './types'
+import { resolveMainMatches } from './candidate-pick'
+
+export { resolveMainMatches } from './candidate-pick'
 
 export interface RenderSegment {
   movieStart: number
@@ -12,31 +15,25 @@ export interface RenderSegment {
   rejected?: boolean
   /** the AI never managed to verify this window */
   unverified?: boolean
+  /** user explicitly picked this clip */
+  userPick?: boolean
 }
 
 /** Single source of truth for both instant preview and exported scene order.
  *
  *  Ordering rules:
  *  1. Scenes ALWAYS follow the short video's timeline (shortStart ascending).
- *  2. When two matches overlap on the short timeline, VERIFIED matches win
- *     over unverified ones; ties break on the earlier movie window.
+ *  2. When two matches overlap on the short timeline, USER PICKS ALWAYS WIN,
+ *     followed by verified matches over unverified ones.
  *  3. Overlapping tails are TRIMMED (1:1 time mapping) instead of dropping the
  *     whole match, so no short-video coverage is silently lost.
  *  4. Back-to-back matches that are continuous in BOTH clocks (e.g. a scene
  *     crossing the 60s minute boundary of a 2-min short) are MERGED into one
  *     scene, so the render has no artificial cut at the boundary. */
 export function buildRenderSegments(scan: Pick<Scan, 'matches'>): RenderSegment[] {
-  const matches = [...(scan.matches || [])]
-    .filter((match) => match.movieEnd - match.movieStart > 0.05)
-    .sort(
-      (a, b) =>
-        a.shortStart - b.shortStart ||
-        Number(b.userPick === true) - Number(a.userPick === true) ||
-        Number(b.verified === true || b.batchVerified === 'confirmed') -
-          Number(a.verified === true || a.batchVerified === 'confirmed') ||
-        (b.confidence || 0) - (a.confidence || 0) ||
-        a.movieStart - b.movieStart,
-    )
+  // Step 1: Deterministically resolve the single main match for each scene.
+  // USER PICKS ALWAYS WIN (highest priority 10,000).
+  const matches = resolveMainMatches(scan.matches || [])
 
   const segments: RenderSegment[] = []
   for (const match of matches) {
@@ -44,72 +41,34 @@ export function buildRenderSegments(scan: Pick<Scan, 'matches'>): RenderSegment[
     const { shortEnd, movieEnd } = match
     const previous = segments.at(-1)
 
-    const isUnverifiedCandidate =
-      match.userPick !== true && match.verified !== true && match.batchVerified !== 'confirmed'
-
-    // If this match is an unverified candidate and ANY verified/user-picked segment
-    // already covers this short time window, completely skip this candidate!
-    if (isUnverifiedCandidate) {
-      const alreadyCovered = segments.some(
-        (s) =>
-          !s.unverified &&
-          !s.rejected &&
-          (Math.abs(s.shortStart - shortStart) < 0.25 ||
-            Math.max(0, Math.min(s.shortEnd, shortEnd) - Math.max(s.shortStart, shortStart)) > 0.1),
-      )
-      if (alreadyCovered) {
-        continue
-      }
-    }
-
     if (previous) {
       const overlap = previous.shortEnd - shortStart
       if (overlap > 0.05) {
-        const prevDuration = previous.shortEnd - previous.shortStart
-        const currDuration = shortEnd - shortStart
-        const shorter = Math.min(prevDuration, currDuration)
-        const isSameSegment =
-          (shorter > 0 && overlap / shorter >= 0.35) ||
-          overlap >= 0.35 ||
-          shortEnd <= previous.shortEnd + 0.05
-
-        if (isSameSegment) {
-          // Alternative candidate or duplicate for the already placed short segment — skip it.
-          continue
+        // If current is user pick and previous is not, protect user pick by trimming previous!
+        if (match.userPick && !previous.userPick) {
+          const trimAmount = overlap
+          previous.shortEnd = shortStart
+          previous.movieEnd = Math.max(previous.movieStart + 0.05, previous.movieEnd - trimAmount)
+        } else {
+          // Normal boundary trim: trim start of current to meet previous end
+          movieStart += overlap
+          shortStart = previous.shortEnd
         }
-
-        // If the previous segment was verified and the current candidate is unverified,
-        // NEVER slice and insert an unverified fragment into a verified scene seam!
-        if (!previous.unverified && !previous.rejected && isUnverifiedCandidate) {
-          continue
-        }
-
-        // Genuine partial boundary overlap between adjacent distinct scenes:
-        movieStart += previous.shortEnd - shortStart
-        shortStart = previous.shortEnd
         if (shortEnd - shortStart <= 0.05 || movieEnd - movieStart <= 0.05) continue
       }
+
       // CONTINUITY MERGE: continuous in both the short AND the movie clock
       // (typical at the 60s minute boundary of a multi-minute short).
       if (
         Math.abs(shortStart - previous.shortEnd) <= 0.25 &&
         Math.abs(movieStart - previous.movieEnd) <= 0.25 &&
-        movieEnd > previous.movieEnd
+        movieEnd > previous.movieEnd &&
+        (!match.userPick || previous.userPick)
       ) {
         previous.shortEnd = shortEnd
         previous.movieEnd = movieEnd
         continue
       }
-    }
-
-    // Prevent unverified matches from duplicating an already placed movie scene elsewhere in the timeline
-    if (isUnverifiedCandidate) {
-      const isDuplicateMovieClip = segments.some(
-        (s) =>
-          Math.max(0, Math.min(s.movieEnd, movieEnd) - Math.max(s.movieStart, movieStart)) > 0.5 ||
-          (Math.abs(s.movieStart - movieStart) < 0.5 && Math.abs(s.movieEnd - movieEnd) < 0.5),
-      )
-      if (isDuplicateMovieClip) continue
     }
 
     const isConfirmed = match.verified === true || match.batchVerified === 'confirmed'
@@ -122,6 +81,7 @@ export function buildRenderSegments(scan: Pick<Scan, 'matches'>): RenderSegment[
       originWindow: match.originWindow,
       rejected: match.rejected === true && match.userPick !== true ? true : undefined,
       unverified: !isConfirmed && match.rejected !== true ? true : undefined,
+      userPick: match.userPick ? true : undefined,
     })
   }
   return segments

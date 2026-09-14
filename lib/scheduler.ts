@@ -448,11 +448,49 @@ class Scheduler {
     groupId: string,
     candidateIndex: number | null,
     viaRescan = false,
+    extra?: {
+      shortStart?: number
+      shortEnd?: number
+      movieStart?: number
+      movieEnd?: number
+      chunkIndex?: number
+      model?: string
+    },
   ): { ok: boolean; error?: string } {
     const job = this.jobs.get(scanId)
     if (!job) return { ok: false, error: 'Scan is not running' }
-    const g = (job.scan.candidateGroups || []).find((x) => x.id === groupId)
-    if (!g) return { ok: false, error: 'Candidate group not found' }
+    job.scan.candidateGroups = job.scan.candidateGroups || []
+    let g = job.scan.candidateGroups.find((x) => x.id === groupId)
+    if (!g && extra?.shortStart != null && extra?.shortEnd != null) {
+      g = job.scan.candidateGroups.find((x) => sameShortSegment(x.shortStart, x.shortEnd, extra.shortStart!, extra.shortEnd!))
+    }
+    if (!g) {
+      if (extra?.shortStart != null && extra?.shortEnd != null && extra?.movieStart != null && extra?.movieEnd != null) {
+        g = {
+          id: groupId || `g-${Date.now()}`,
+          shortStart: extra.shortStart,
+          shortEnd: extra.shortEnd,
+          status: 'confirmed',
+          confirmedIndex: 0,
+          confirmedViaRescan: false,
+          candidates: [
+            {
+              shortStart: extra.shortStart,
+              shortEnd: extra.shortEnd,
+              movieStart: extra.movieStart,
+              movieEnd: extra.movieEnd,
+              chunkIndex: extra.chunkIndex ?? 0,
+              model: extra.model ?? 'gemini-3.7-flash',
+              verdict: 'same',
+              rescan: 'none',
+            },
+          ],
+        }
+        job.scan.candidateGroups.push(g)
+      } else {
+        return { ok: false, error: 'Candidate group not found' }
+      }
+    }
 
     if (candidateIndex === null) {
       delete g.userPick
@@ -463,9 +501,30 @@ class Scheduler {
         `User choice cleared for short ${fmtTime(g.shortStart)}–${fmtTime(g.shortEnd)} — AI verdict (${g.status}) restored`,
       )
     } else {
-      const idx = Number(candidateIndex)
+      let idx = Number(candidateIndex)
       if (!Number.isInteger(idx) || idx < 0 || idx >= g.candidates.length) {
-        return { ok: false, error: 'Invalid candidate index' }
+        if (extra?.movieStart != null && extra?.movieEnd != null) {
+          const found = g.candidates.findIndex(
+            (c) => Math.abs(c.movieStart - extra.movieStart!) < 0.5 && Math.abs(c.movieEnd - extra.movieEnd!) < 0.5,
+          )
+          if (found >= 0) {
+            idx = found
+          } else {
+            idx = g.candidates.length
+            g.candidates.push({
+              shortStart: extra.shortStart ?? g.shortStart,
+              shortEnd: extra.shortEnd ?? g.shortEnd,
+              movieStart: extra.movieStart,
+              movieEnd: extra.movieEnd,
+              chunkIndex: extra.chunkIndex ?? 0,
+              model: extra.model ?? 'gemini-3.7-flash',
+              verdict: 'same',
+              rescan: 'none',
+            })
+          }
+        } else {
+          return { ok: false, error: 'Invalid candidate index' }
+        }
       }
       const c = g.candidates[idx]
       if (viaRescan && (c.rescanMovieStart == null || c.rescanMovieEnd == null)) {

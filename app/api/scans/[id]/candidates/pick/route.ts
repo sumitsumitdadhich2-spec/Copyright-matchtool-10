@@ -48,6 +48,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       body.groupId || '',
       body.candidateIndex === null ? null : body.candidateIndex,
       body.viaRescan === true,
+      body,
     )
     if (!res.ok) {
       return NextResponse.json({ error: res.error || 'Choice apply nahi ho saki' }, { status: 400 })
@@ -55,11 +56,38 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     invalidateRenderedOutput(scan)
     return NextResponse.json({ ok: true })
   }
-  let g = (scan.candidateGroups || []).find((x) => x.id === body.groupId)
+  scan.candidateGroups = scan.candidateGroups || []
+  let g = scan.candidateGroups.find((x) => x.id === body.groupId)
   if (!g && body.shortStart != null && body.shortEnd != null) {
-    g = (scan.candidateGroups || []).find((x) => sameShortSegment(x.shortStart, x.shortEnd, body.shortStart!, body.shortEnd!))
+    g = scan.candidateGroups.find((x) => sameShortSegment(x.shortStart, x.shortEnd, body.shortStart!, body.shortEnd!))
   }
-  if (!g) return NextResponse.json({ error: 'Candidate group not found' }, { status: 404 })
+  if (!g) {
+    if (body.shortStart != null && body.shortEnd != null && body.movieStart != null && body.movieEnd != null) {
+      g = {
+        id: body.groupId || `g-${Date.now()}`,
+        shortStart: body.shortStart,
+        shortEnd: body.shortEnd,
+        status: 'confirmed',
+        confirmedIndex: 0,
+        confirmedViaRescan: false,
+        candidates: [
+          {
+            shortStart: body.shortStart,
+            shortEnd: body.shortEnd,
+            movieStart: body.movieStart,
+            movieEnd: body.movieEnd,
+            chunkIndex: body.chunkIndex ?? 0,
+            model: body.model ?? 'gemini-3.7-flash',
+            verdict: 'same',
+            rescan: 'none',
+          },
+        ],
+      }
+      scan.candidateGroups.push(g)
+    } else {
+      return NextResponse.json({ error: 'Candidate group not found' }, { status: 404 })
+    }
+  }
 
   if (body.candidateIndex === null) {
     delete g.userPick

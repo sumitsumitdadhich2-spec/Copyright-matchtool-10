@@ -599,6 +599,10 @@ function StitchedPreview({
     [scan, segments],
   )
   const current = segments[segIdx]
+  const currentShortStartRef = useRef<number>(0)
+  if (current) {
+    currentShortStartRef.current = current.shortStart
+  }
   const candidateOptions = optionsPerSegment[segIdx] ?? []
   const showChooser = hasAlternatives(candidateOptions)
   const viewing = candIdx === null ? null : candidateOptions[Math.min(candIdx, candidateOptions.length - 1)]
@@ -606,13 +610,24 @@ function StitchedPreview({
   const activeStart = viewing ? viewing.movieStart : current?.movieStart ?? 0
   const activeEnd = viewing ? viewing.movieEnd : current?.movieEnd ?? 0
 
-  // Reset when the segment count changes (new matches between refreshes).
+  // Preserve scene position when segment count changes (e.g. after user pick or scan updates).
   useEffect(() => {
-    setSegIdx(0)
-    setPlaying(false)
-    setStitchedPos(0)
+    if (segments.length === 0) {
+      setSegIdx(0)
+      setPlaying(false)
+      setStitchedPos(0)
+      setCandIdx(null)
+      return
+    }
+    const targetShort = currentShortStartRef.current
+    const found = segments.findIndex((s) => Math.abs(s.shortStart - targetShort) < 0.35)
+    if (found >= 0) {
+      setSegIdx(found)
+    } else {
+      setSegIdx((prev) => Math.min(prev, Math.max(0, segments.length - 1)))
+    }
     setCandIdx(null)
-  }, [segments.length])
+  }, [segments.length]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // A user pick can replace the current scene with a same-length movie window.
   // Seek immediately so the paused frame agrees with the refreshed MAIN label.
@@ -719,7 +734,7 @@ function StitchedPreview({
             {candidateOptions.length} candidates
           </span>
         )}
-        {current && candidateOptions.some((o) => o.isMain && o.isUserPick) && (
+        {current && (current.userPick || candidateOptions.some((o) => o.isMain && o.isUserPick)) && (
           <span className="rounded-full bg-success/15 px-2 py-0.5 font-mono text-[10px] text-success">your choice</span>
         )}
         <span className="ml-auto font-mono text-[10px] text-muted-foreground">

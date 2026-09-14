@@ -33,6 +33,64 @@ export function sameShortSegment(aStart: number, aEnd: number, bStart: number, b
   return false
 }
 
+/** Resolves a list of matches to a single, non-overlapping sequence of main matches.
+ *  Priority rules:
+ *  1. User pick (`userPick === true`) ALWAYS wins (highest priority).
+ *  2. Confirmed/Verified (`verified === true || batchVerified === 'confirmed'`) wins over unverified.
+ *  3. Non-rejected wins over rejected (`rejected === true || batchVerified === 'rejected'`).
+ *  4. Longer short duration and higher confidence break ties.
+ *  5. Earlier shortStart breaks remaining ties.
+ */
+export function resolveMainMatches(matches: ChunkMatch[]): ChunkMatch[] {
+  if (!matches || matches.length === 0) return []
+
+  const valid = matches.filter((m) => m && m.movieEnd - m.movieStart > 0.05)
+
+  // 1. Sort by deterministic priority descending, so the chosen or best match is evaluated first:
+  const sorted = [...valid].sort((a, b) => {
+    const aPick = a.userPick ? 1 : 0
+    const bPick = b.userPick ? 1 : 0
+    if (aPick !== bPick) return bPick - aPick
+
+    const aConf = (a.verified || a.batchVerified === 'confirmed') ? 1 : 0
+    const bConf = (b.verified || b.batchVerified === 'confirmed') ? 1 : 0
+    if (aConf !== bConf) return bConf - aConf
+
+    const aRej = (a.rejected || a.batchVerified === 'rejected') ? 1 : 0
+    const bRej = (b.rejected || b.batchVerified === 'rejected') ? 1 : 0
+    if (aRej !== bRej) return aRej - bRej
+
+    const aDur = a.shortEnd - a.shortStart
+    const bDur = b.shortEnd - b.shortStart
+    if (Math.abs(aDur - bDur) > 0.1) return bDur - aDur
+
+    return (b.confidence || 0) - (a.confidence || 0) || a.shortStart - b.shortStart
+  })
+
+  // 2. Greedily accept matches. Since higher-priority matches come first,
+  // any conflicting candidate or duplicate for the same short segment is rejected.
+  const accepted: ChunkMatch[] = []
+  for (const m of sorted) {
+    const conflicts = accepted.some((existing) => {
+      if (sameShortSegment(existing.shortStart, existing.shortEnd, m.shortStart, m.shortEnd)) return true
+      const overlap = Math.min(existing.shortEnd, m.shortEnd) - Math.max(existing.shortStart, m.shortStart)
+      const shorter = Math.min(existing.shortEnd - existing.shortStart, m.shortEnd - m.shortStart)
+      if (overlap > 0 && shorter > 0) {
+        if (overlap >= 0.25 || overlap / shorter >= 0.25) return true
+      }
+      return false
+    })
+
+    if (!conflicts) {
+      accepted.push(m)
+    }
+  }
+
+  // 3. Sort chronologically by shortStart
+  accepted.sort((a, b) => a.shortStart - b.shortStart)
+  return accepted
+}
+
 /** Provenance of a match produced from group `g`. A rescan-found window is
  *  'rescan' — unless the group itself came from the gap-backup pass, whose
  *  origin is the more useful thing to know downstream. */
@@ -87,7 +145,18 @@ export function applyGroupMatches(scan: Scan, g: CandidateGroup): void {
   const pick = g.userPick
   const picked = pick ? g.candidates[pick.index] : undefined
 
-  scan.matches = (scan.matches || []).filter((m) => !sameShortSegment(g.shortStart, g.shortEnd, m.shortStart, m.shortEnd))
+  const pStart = picked?.shortStart ?? g.shortStart
+  const pEnd = picked?.shortEnd ?? g.shortEnd
+
+  // Remove any match that belongs to this group or overlaps this exact short scene
+  scan.matches = (scan.matches || []).filter((m) => {
+    if (sameShortSegment(g.shortStart, g.shortEnd, m.shortStart, m.shortEnd)) return false
+    if (sameShortSegment(pStart, pEnd, m.shortStart, m.shortEnd)) return false
+    const overlap = Math.min(m.shortEnd, pEnd) - Math.max(m.shortStart, pStart)
+    const shorter = Math.min(m.shortEnd - m.shortStart, pEnd - pStart)
+    if (overlap > 0 && shorter > 0 && overlap / shorter >= 0.3) return false
+    return true
+  })
 
   if (picked && pick) {
     const useRescan = pick.viaRescan && picked.rescanMovieStart != null && picked.rescanMovieEnd != null
@@ -98,7 +167,7 @@ export function applyGroupMatches(scan: Scan, g: CandidateGroup): void {
       movieEnd: useRescan ? picked.rescanMovieEnd! : picked.movieEnd,
       chunkIndex: picked.chunkIndex,
       model: picked.model,
-      confidence: picked.confidence,
+      confidence: picked.confidence ?? 0.95,
       verified: true,
       viaRescan: useRescan || undefined,
       userPick: true,
@@ -227,7 +296,8 @@ export function candidateOptionsFor(scan: Pick<Scan, 'matches' | 'candidateGroup
       Math.min(g.shortEnd, shortEnd) - Math.max(g.shortStart, shortStart) > 0.05
     )
   })
-  const mains = (scan.matches || []).filter(
+  const resolved = resolveMainMatches(scan.matches || [])
+  const mains = resolved.filter(
     (m) =>
       sameShortSegment(m.shortStart, m.shortEnd, shortStart, shortEnd) ||
       Math.min(m.shortEnd, shortEnd) - Math.max(m.shortStart, shortStart) > 0.05,
@@ -238,7 +308,9 @@ export function candidateOptionsFor(scan: Pick<Scan, 'matches' | 'candidateGroup
   for (const g of groups) {
     ;(g.candidates || []).forEach((c, index) => {
       const push = (viaRescan: boolean, ms: number, me: number) => {
-        const isUserPick = !!g.userPick && g.userPick.index === index && g.userPick.viaRescan === viaRescan
+        const isUserPick =
+          (!!g.userPick && g.userPick.index === index && g.userPick.viaRescan === viaRescan) ||
+          (!!main?.userPick && Math.abs(main.movieStart - ms) < 0.5 && Math.abs(main.movieEnd - me) < 0.5)
         out.push({
           groupId: g.id,
           groupStatus: g.status,
@@ -343,6 +415,7 @@ export function candidateOptionsFor(scan: Pick<Scan, 'matches' | 'candidateGroup
       o.state = 'main'
       o.rejectedKept = isRejectedKept(main || o)
       if (main?.origin) o.origin = main.origin
+      if (main?.userPick) o.isUserPick = true
     } else {
       o.isMain = false
     }
