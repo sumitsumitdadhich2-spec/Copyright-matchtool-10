@@ -913,18 +913,19 @@ export async function preparePrescanMovieCopy(
  */
 const activeFastPreviewJobs = new Set<string>()
 
-export function triggerFastPreview(scanId: string, movieFile: string, outDir: string): void {
-  if (activeFastPreviewJobs.has(scanId)) return
-  const previewPath = path.join(outDir, 'preview-movie.mp4')
+export function triggerFastPreview(scanId: string, videoFile: string, outDir: string, kind: 'movie' | 'short' = 'movie'): void {
+  const jobKey = `${scanId}-${kind}`
+  if (activeFastPreviewJobs.has(jobKey)) return
+  const previewPath = path.join(outDir, `preview-${kind}.mp4`)
   if (fs.existsSync(previewPath) && fs.statSync(previewPath).size > 1000) return
 
-  activeFastPreviewJobs.add(scanId)
+  activeFastPreviewJobs.add(jobKey)
   void (async () => {
     try {
-      const tempPath = path.join(outDir, `.preview-movie-tmp-${Date.now()}.mp4`)
+      const tempPath = path.join(outDir, `.preview-${kind}-tmp-${Date.now()}.mp4`)
       await runFfmpeg([
         '-y',
-        '-i', movieFile,
+        '-i', videoFile,
         '-vf', "scale='min(640,iw)':-2,fps=24",
         '-c:v', 'libx264',
         '-preset', 'ultrafast',
@@ -934,16 +935,16 @@ export function triggerFastPreview(scanId: string, movieFile: string, outDir: st
         '-ac', '1',
         '-movflags', '+faststart',
         tempPath,
-      ], { label: `fast-preview-${scanId}` })
+      ], { label: `fast-preview-${jobKey}` })
 
       if (fs.existsSync(tempPath) && fs.statSync(tempPath).size > 1000) {
         fs.renameSync(tempPath, previewPath)
-        console.log(`[preview] Fast web preview ready for ${scanId}: ${(fs.statSync(previewPath).size / (1024 * 1024)).toFixed(1)} MB`)
+        console.log(`[preview] Fast web preview ready for ${jobKey}: ${(fs.statSync(previewPath).size / (1024 * 1024)).toFixed(1)} MB`)
       }
     } catch (err) {
-      console.warn(`[preview] Fast web preview creation failed for ${scanId}:`, err)
+      console.warn(`[preview] Fast web preview creation failed for ${jobKey}:`, err)
     } finally {
-      activeFastPreviewJobs.delete(scanId)
+      activeFastPreviewJobs.delete(jobKey)
     }
   })()
 }

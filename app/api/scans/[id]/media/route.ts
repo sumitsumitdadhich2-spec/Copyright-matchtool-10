@@ -29,22 +29,21 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
   let streamFile = file
   const mediaDir = scanMediaDir(id)
 
-  if (kind === 'movie') {
-    const previewFile = path.join(mediaDir, 'preview-movie.mp4')
-    const prescanFile = path.join(mediaDir, 'prescan-movie.mp4')
-    if (fs.existsSync(previewFile) && fs.statSync(previewFile).size > 1000) {
-      streamFile = previewFile
-    } else if (
-      fs.existsSync(prescanFile) &&
-      fs.statSync(prescanFile).size > 1000 &&
-      fs.statSync(prescanFile).size < fs.statSync(file).size * 0.75
-    ) {
-      // prescan-movie is a re-encoded lightweight copy!
-      streamFile = prescanFile
-    } else {
-      // Trigger background fast preview so subsequent seeks/loads are instantaneous
-      triggerFastPreview(id, file, mediaDir)
-    }
+  const previewFile = path.join(mediaDir, `preview-${kind}.mp4`)
+  const prescanFile = path.join(mediaDir, `prescan-${kind}.mp4`)
+  if (fs.existsSync(previewFile) && fs.statSync(previewFile).size > 1000) {
+    streamFile = previewFile
+  } else if (
+    kind === 'movie' &&
+    fs.existsSync(prescanFile) &&
+    fs.statSync(prescanFile).size > 1000 &&
+    fs.statSync(prescanFile).size < fs.statSync(file).size * 0.75
+  ) {
+    // prescan-movie is a re-encoded lightweight copy!
+    streamFile = prescanFile
+  } else {
+    // Trigger background fast preview so subsequent seeks/loads are instantaneous
+    triggerFastPreview(id, file, mediaDir, kind)
   }
 
   const stat = fs.statSync(streamFile)

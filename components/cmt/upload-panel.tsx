@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, type DragEvent } from 'react'
 import { useSWRConfig } from 'swr'
-import { Film, Clapperboard, Loader2, CheckCircle2, X, RefreshCw, WifiOff, Zap } from 'lucide-react'
+import { Film, Clapperboard, Loader2, CheckCircle2, X, RefreshCw, WifiOff, Zap, FolderOpen } from 'lucide-react'
 import type { Scan } from '@/lib/types'
 import { fmtTime, fmtBytes } from '@/lib/format'
 import { uploadVideoStream, fmtMbps, fmtEta, UploadError, type UploadProgress, type UploadKind } from '@/lib/upload-client'
@@ -23,7 +23,7 @@ interface LocalPick {
   name: string
   size: number
   /** Duration read from the browser's video decoder; null while loading /
-   *  when the container can't be parsed client-side (e.g. some MKVs). */
+   *  when the container can't be parsed client-side (e.g. some MKVs or 4K Blu-ray). */
   duration: number | null
 }
 
@@ -34,32 +34,111 @@ interface Job {
   progress: UploadProgress
 }
 
-const ALLOWED_EXT = ['.mp4', '.mov', '.mkv', '.webm']
-function isAllowedVideo(f: File) {
-  const name = f.name.toLowerCase()
-  return ALLOWED_EXT.some((ext) => name.endsWith(ext))
+/** Comprehensive list of supported video formats — Blu-ray, 4K/2K, MKV, M2TS, MP4, etc. */
+export const ALL_VIDEO_EXTENSIONS = [
+  '.mp4',
+  '.mkv',
+  '.m2ts',
+  '.mts',
+  '.ts',
+  '.mov',
+  '.webm',
+  '.avi',
+  '.wmv',
+  '.m4v',
+  '.flv',
+  '.f4v',
+  '.vob',
+  '.mpg',
+  '.mpeg',
+  '.m2v',
+  '.3gp',
+  '.3g2',
+  '.ogv',
+  '.divx',
+  '.asf',
+  '.rm',
+  '.rmvb',
+  '.dat',
+  '.iso',
+]
+
+/** Broad accept filter for file pickers (including video types and universal wildcard) */
+const ACCEPT_ALL_VIDEOS =
+  'video/*,.mkv,.mp4,.mov,.webm,.m2ts,.mts,.ts,.avi,.wmv,.flv,.m4v,.3gp,.3g2,.vob,.mpg,.mpeg,.divx,.asf,.rmvb,*/*'
+
+function isAllowedVideo(f: File): boolean {
+  if (!f || f.size === 0) return false
+  const name = (f.name || '').toLowerCase()
+
+  // 1. Matches any known video extension
+  if (ALL_VIDEO_EXTENSIONS.some((ext) => name.endsWith(ext))) return true
+
+  // 2. Matches video MIME type or common video container MIME
+  const type = (f.type || '').toLowerCase()
+  if (type.startsWith('video/')) return true
+  if (
+    type.includes('matroska') ||
+    type.includes('mp4') ||
+    type.includes('quicktime') ||
+    type.includes('webm') ||
+    type.includes('mpeg') ||
+    type.includes('m2ts') ||
+    type.includes('avi')
+  ) {
+    return true
+  }
+
+  // 3. Exclude obvious non-video files
+  const nonVideoExt = [
+    '.txt', '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    '.zip', '.rar', '.7z', '.tar', '.gz', '.apk', '.exe',
+    '.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg',
+    '.mp3', '.wav', '.flac', '.aac', '.m4a', '.ogg',
+    '.srt', '.vtt', '.ass', '.sub',
+  ]
+  if (nonVideoExt.some((ext) => name.endsWith(ext))) return false
+
+  // 4. Any other file picked by the user via file manager or storage is accepted:
+  // FFmpeg on the server will definitively verify and probe it.
+  return true
 }
 
 /** Read the video's duration in the browser (usually < 100 ms — it only parses
- *  the header, never the whole file). Resolves null if the browser can't. */
+ *  the header, never the whole file). Resolves null if the browser can't (e.g. 4K HEVC or unsupported MKVs). */
 function readLocalDuration(file: File): Promise<number | null> {
   return new Promise((resolve) => {
-    const url = URL.createObjectURL(file)
+    let settled = false
+    let url = ''
+    try {
+      url = URL.createObjectURL(file)
+    } catch {
+      resolve(null)
+      return
+    }
     const v = document.createElement('video')
     v.preload = 'metadata'
-    let settled = false
     const finish = (d: number | null) => {
       if (settled) return
       settled = true
-      URL.revokeObjectURL(url)
-      v.removeAttribute('src')
-      v.load()
+      try {
+        URL.revokeObjectURL(url)
+        v.removeAttribute('src')
+        v.load()
+      } catch {
+        // ignore
+      }
       resolve(d)
     }
     v.onloadedmetadata = () => finish(Number.isFinite(v.duration) && v.duration > 0 ? v.duration : null)
     v.onerror = () => finish(null)
-    setTimeout(() => finish(null), 8000)
-    v.src = url
+    // Quick timeout: don't hang if hardware cannot decode 4K/MKV locally
+    setTimeout(() => finish(null), 2500)
+    try {
+      v.src = url
+    } catch {
+      finish(null)
+    }
   })
 }
 
@@ -116,7 +195,10 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
     const initialScanId = scanIdRef.current
     const tempKey = `${initialScanId ?? 'new'}/${kind}`
     if (!isAllowedVideo(file)) {
-      setErrors((previous) => ({ ...previous, [tempKey]: 'Only MP4, MOV, MKV or WebM video files are supported' }))
+      setErrors((previous) => ({
+        ...previous,
+        [tempKey]: 'Please select a valid video file (MP4, MKV, M2TS, TS, AVI, MOV, WebM, 4K/Blu-ray, etc.)',
+      }))
       return
     }
     const controller = new AbortController()
@@ -207,7 +289,12 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
   return (
     <section aria-label="Upload videos" className="panel">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-sm font-semibold">Source Files</h2>
+        <div className="flex flex-wrap items-center gap-2">
+          <h2 className="text-sm font-semibold">Source Files</h2>
+          <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-400">
+            ✓ All formats supported: MKV, Blu-ray (M2TS/TS), 4K/2K, MP4, AVI, MOV, WebM, etc.
+          </span>
+        </div>
         {scan?.autoMode !== false ? (
           <span className="flex items-center gap-1.5 rounded-full border border-cyan-500/30 bg-cyan-500/10 px-2.5 py-0.5 text-[11px] font-semibold text-cyan-300">
             <Zap className="size-3 text-cyan-400" aria-hidden />
@@ -215,6 +302,14 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
           </span>
         ) : null}
       </div>
+
+      <div className="mt-2.5 flex items-start gap-2 rounded-lg border border-primary/20 bg-primary/5 p-2.5 text-xs text-muted-foreground">
+        <FolderOpen className="size-4 shrink-0 text-primary mt-0.5" aria-hidden />
+        <p className="leading-relaxed">
+          <strong className="text-foreground font-semibold">Tablet / Android Tip:</strong> Agar aapke tablet ki Gallery me 2K / 4K ya MKV Blu-ray movie na dikhe (kyunki Gallery unhe filter kar deti hai), to card me diye gaye <strong className="text-foreground">&ldquo;Browse Storage / All Files&rdquo;</strong> button par click karein aur apne Downloads ya Internal Storage se file select karein.
+        </p>
+      </div>
+
       <div className="mt-3 grid gap-3 md:grid-cols-2">
         <Dropzone
           kind="short"
@@ -299,6 +394,7 @@ function Dropzone(props: {
   extraInfo?: string
 }) {
   const inputRef = useRef<HTMLInputElement>(null)
+  const allFilesInputRef = useRef<HTMLInputElement>(null)
   const [dragOver, setDragOver] = useState(false)
   const uploading = props.progress !== null
   // A file is "picked" as soon as we know its name — locally or from the server.
@@ -314,17 +410,38 @@ function Dropzone(props: {
 
   return (
     <div className="relative">
-      <button
-        type="button"
-        onClick={() => inputRef.current?.click()}
+      {/* Hidden file inputs: broad video types and direct storage/all files */}
+      <input
+        ref={inputRef}
+        type="file"
+        accept={ACCEPT_ALL_VIDEOS}
+        className="sr-only"
+        onChange={(e) => {
+          const f = e.target.files?.[0]
+          if (f) props.onFile(f)
+          e.target.value = ''
+        }}
+      />
+      <input
+        ref={allFilesInputRef}
+        type="file"
+        accept="*/*"
+        className="sr-only"
+        onChange={(e) => {
+          const f = e.target.files?.[0]
+          if (f) props.onFile(f)
+          e.target.value = ''
+        }}
+      />
+
+      <div
         onDragOver={(e) => {
           e.preventDefault()
           setDragOver(true)
         }}
         onDragLeave={() => setDragOver(false)}
         onDrop={onDrop}
-        disabled={props.disabled}
-        className={`btn-press flex w-full flex-col items-start gap-1.5 rounded-lg border border-dashed p-4 text-left ${
+        className={`flex w-full flex-col items-start gap-2 rounded-lg border border-dashed p-4 text-left transition-all ${
           dragOver
             ? 'scale-[1.01] border-primary bg-primary/10'
             : done
@@ -332,19 +449,8 @@ function Dropzone(props: {
               : picked
                 ? 'border-primary/50 bg-primary/5'
                 : 'border-input hover:border-primary/60 hover:bg-primary/5'
-        } disabled:opacity-60`}
+        } ${props.disabled ? 'opacity-60' : ''}`}
       >
-        <input
-          ref={inputRef}
-          type="file"
-          accept=".mp4,.mov,.mkv,.webm,video/mp4,video/quicktime,video/x-matroska,video/webm"
-          className="sr-only"
-          onChange={(e) => {
-            const f = e.target.files?.[0]
-            if (f) props.onFile(f)
-            e.target.value = ''
-          }}
-        />
         <div className="flex w-full items-center gap-2">
           <span className={done ? 'text-success' : 'text-primary'}>{done ? <CheckCircle2 className="size-5" aria-hidden /> : props.icon}</span>
           <span className="text-sm font-medium">{props.title}</span>
@@ -355,10 +461,11 @@ function Dropzone(props: {
             </span>
           )}
         </div>
+
         {picked ? (
           <>
             <div className="w-full truncate font-mono text-xs text-muted-foreground">
-              {props.name} · {props.duration ? fmtTime(props.duration) : '—:—'} · {props.size ? fmtBytes(props.size) : ''}
+              {props.name} · {props.duration ? fmtTime(props.duration) : 'Checking on server…'} · {props.size ? fmtBytes(props.size) : ''}
             </div>
             {props.progress ? (
               <UploadMeter p={props.progress} />
@@ -367,16 +474,43 @@ function Dropzone(props: {
             )}
           </>
         ) : (
-          <span className="text-xs text-muted-foreground">{props.subtitle} — click or drop a file</span>
+          <div className="flex w-full flex-col gap-2">
+            <span className="text-xs text-muted-foreground">{props.subtitle}</span>
+            <div className="mt-1 flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => inputRef.current?.click()}
+                disabled={props.disabled}
+                className="btn-press inline-flex items-center gap-1.5 rounded-md border border-primary/40 bg-primary/10 px-3 py-1.5 text-xs font-medium text-primary hover:bg-primary/20 transition-colors cursor-pointer disabled:opacity-50"
+                title="Select video using default gallery/files"
+              >
+                <Film className="size-3.5" aria-hidden /> Select Video
+              </button>
+
+              <button
+                type="button"
+                onClick={() => allFilesInputRef.current?.click()}
+                disabled={props.disabled}
+                className="btn-press inline-flex items-center gap-1.5 rounded-md border border-input bg-card px-3 py-1.5 text-xs font-medium text-foreground hover:border-primary/60 hover:bg-secondary transition-colors cursor-pointer shadow-xs disabled:opacity-50"
+                title="Open System File Manager (All Files / Storage) — bypasses gallery filters for 2K/4K Blu-ray & MKV"
+              >
+                <FolderOpen className="size-3.5 text-primary" aria-hidden /> Browse Storage (MKV · 4K · Blu-ray)
+              </button>
+            </div>
+            <span className="text-[10px] text-muted-foreground/80">
+              Drag & drop or select any video format: MKV, M2TS, TS, 4K/2K, MP4, AVI, MOV, WebM, etc.
+            </span>
+          </div>
         )}
-      </button>
+      </div>
+
       {uploading && (
         <button
           type="button"
           onClick={props.onCancel}
           aria-label={`Cancel ${props.title.toLowerCase()} upload`}
           title="Cancel upload"
-          className="absolute right-3 top-3 flex size-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-destructive/15 hover:text-destructive"
+          className="absolute right-3 top-3 flex size-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-destructive/15 hover:text-destructive cursor-pointer"
         >
           <X className="size-3.5" aria-hidden />
         </button>

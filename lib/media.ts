@@ -634,6 +634,9 @@ export async function finalizeUploadedMedia(
     )
     saveScan(scan, { immediate: true })
 
+    // Immediately trigger lightweight web preview generation in background for ultra-fast UI playback
+    triggerFastPreview(id, dest, mediaDir, 'short')
+
     // Background: cut 24 fps / 640px scan segments — original untouched.
     const segDir = path.join(mediaDir, 'segments')
     void (async () => {
