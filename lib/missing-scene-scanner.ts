@@ -549,11 +549,11 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
               continue
             }
             if (re.kind === 'rpd') {
-              globalGeminiCoordinator.reportExhausted(selected.apiKey, selected.modelId)
+              globalGeminiCoordinator.reportExhausted(selected.apiKey, selected.modelId, 0, selected.rpd || 20)
               addLog(
                 scan,
                 'warn',
-                `[Missing Scene Finder] Chunk ${chunkIdx + 1}: Daily quota exhausted on Key ${selected.keyIdx} (${selected.modelId}) — switching lane...`,
+                `[Missing Scene Finder] Chunk ${chunkIdx + 1}: Daily quota exhausted on Key ${selected.keyIdx} (${selected.modelId}) — persisted, switching to remaining models on Key ${selected.keyIdx} or next key...`,
               )
               continue
             }
@@ -736,11 +736,11 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
               continue
             }
             if (re.kind === 'rpd') {
-              globalGeminiCoordinator.reportExhausted(selected.apiKey, selected.modelId)
+              globalGeminiCoordinator.reportExhausted(selected.apiKey, selected.modelId, 0, selected.rpd || 20)
               addLog(
                 scan,
                 'warn',
-                `[Missing Scene Finder] ${winLabel}: Daily quota exhausted on Key ${selected.keyIdx} (${selected.modelId}) — switching lane...`,
+                `[Missing Scene Finder] ${winLabel}: Daily quota exhausted on Key ${selected.keyIdx} (${selected.modelId}) — persisted, switching to remaining models on Key ${selected.keyIdx} or next key...`,
               )
               continue
             }

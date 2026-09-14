@@ -948,19 +948,16 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
       continue
     }
 
-    const keyCool = ctrl.cooldownUntil[lane.keyId] || 0
-    const cool = Math.max(keyCool, ctrl.cooldownUntil[rk] || 0)
+    const cool = ctrl.cooldownUntil[rk] || 0
     if (cool > Date.now()) {
       await sleep(Math.min(2000, cool - Date.now()))
       continue
     }
 
     // Pacing spacing check before pulling from queue:
-    const keyWait = (ctrl.nextFreeAt[lane.keyId] || 0) - Date.now()
     const laneWait = (ctrl.nextFreeAt[rk] || 0) - Date.now()
-    const wait = Math.max(keyWait, laneWait)
-    if (wait > 0) {
-      await sleep(Math.min(2000, wait))
+    if (laneWait > 0) {
+      await sleep(Math.min(2000, laneWait))
       continue
     }
 
@@ -1138,14 +1135,13 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
         queue.push(idx)
         log(id, 'warn', `Key ${lane.keyIdx} · ${lane.model.id}: model daily quota exhausted (${lane.model.rpd}/${lane.model.rpd} RPD) — model lane removed, key ${lane.keyIdx}'s other models remain active; ${tag.toLowerCase()} #${w.index} re-queued`)
       } else if (e.kind === 'rate') {
-        // 429 RPM/TPM: progressive cooldown (15s, 30s, 60s) instead of flat 60s lockup
+        // 429 RPM/TPM: progressive cooldown (15s, 30s, 60s) on this specific model only
         const coolMs = Math.min(60_000, 15_000 * Math.pow(2, (w.attempts || 1) - 1))
         globalGeminiCoordinator.reportRateLimit(lane.apiKey, lane.model.id, coolMs, 0)
-        ctrl.cooldownUntil[lane.keyId] = Date.now() + coolMs
         ctrl.cooldownUntil[rk] = Date.now() + coolMs
         w.status = 'pending'
         queue.push(idx)
-        log(id, 'warn', `${tag} #${w.index}: 429/rate on ${lane.label} — ${Math.round(coolMs / 1000)}s cooldown, re-queued: ${e.message.slice(0, 120)}`)
+        log(id, 'warn', `${tag} #${w.index}: 429/rate on ${lane.label} — ${Math.round(coolMs / 1000)}s cooldown (other models on Key ${lane.keyIdx} remain active), re-queued: ${e.message.slice(0, 120)}`)
       } else if (isFileGoneError(e.message)) {
         w.status = 'pending'
         queue.push(idx)

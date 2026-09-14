@@ -1,6 +1,6 @@
 import 'server-only'
 
-import { apiKeyHash, getModelUsage } from './store'
+import { apiKeyHash, getModelUsage, setModelExhausted } from './store'
 import { pacingIntervalMs, RATE_COOLDOWN_MS } from './models'
 
 export interface CandidateLane {
@@ -300,11 +300,15 @@ class GlobalGeminiCoordinator {
 
       const now = Date.now()
 
-      // 1. Filter out permanently exhausted / disabled lanes
+      // 1. Filter out permanently exhausted / disabled lanes and persist exhausted state
       const availableCandidates = candidates.filter((c) => {
         const lane = this.getOrCreateLane(c.apiKey, c.modelId, c.slot || 0, c.keyIdx)
         if (lane.isExhausted) return false
-        if (c.rpd && getModelUsage(c.modelId, c.apiKey) >= c.rpd) return false
+        const rpdCap = c.rpd || 20
+        if (getModelUsage(c.modelId, c.apiKey) >= rpdCap) {
+          lane.isExhausted = true
+          return false
+        }
         return true
       })
 
@@ -312,8 +316,17 @@ class GlobalGeminiCoordinator {
         throw new Error('All candidate keys/models have reached their daily quota or are exhausted')
       }
 
+      // Sort candidates to prioritize same-key multi-model usage before switching keys:
+      // Group by keyIdx ascending, and test available models on the current key first
+      const sortedCandidates = [...availableCandidates].sort((a, b) => {
+        if (a.keyIdx !== b.keyIdx) return a.keyIdx - b.keyIdx
+        const aUsage = getModelUsage(a.modelId, a.apiKey)
+        const bUsage = getModelUsage(b.modelId, b.apiKey)
+        return aUsage - bUsage
+      })
+
       // 2. Check for immediately FREE lanes (no active scan, no cooldown, no pacing wait, no waiters)
-      for (const cand of availableCandidates) {
+      for (const cand of sortedCandidates) {
         const lane = this.getOrCreateLane(cand.apiKey, cand.modelId, cand.slot || 0, cand.keyIdx)
         const isFree =
           lane.activeScanId === null &&
@@ -337,7 +350,7 @@ class GlobalGeminiCoordinator {
       }
 
       // 3. None are immediately free. Calculate estimated shortest wait time across all candidate lanes
-      const waits = availableCandidates.map((c) => {
+      const waits = sortedCandidates.map((c) => {
         const lane = this.getOrCreateLane(c.apiKey, c.modelId, c.slot || 0, c.keyIdx)
         const cdWait = Math.max(0, lane.cooldownUntil - now)
         const paceWait = Math.max(0, lane.nextFreeAt - now)
@@ -450,7 +463,7 @@ class GlobalGeminiCoordinator {
   }
 
   /** Report that a model's daily quota has been exhausted across the entire app */
-  public reportExhausted(apiKey: string, modelId: string, slot: number = 0) {
+  public reportExhausted(apiKey: string, modelId: string, slot: number = 0, rpdCap: number = 20) {
     const kh = apiKeyHash(apiKey)
     const lane = this.getOrCreateLane(apiKey, modelId, slot)
     lane.isExhausted = true
@@ -461,6 +474,11 @@ class GlobalGeminiCoordinator {
         other.isExhausted = true
       }
     }
+
+    // Persist to counters.json so subsequent workers/processes know this model is quota-capped today
+    try {
+      setModelExhausted(modelId, apiKey, rpdCap)
+    } catch {}
   }
 
   /** Get snapshot summary of all active/busy lanes across the application */
