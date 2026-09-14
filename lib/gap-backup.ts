@@ -119,7 +119,12 @@ export function gapBackupPreview(scan: Scan) {
   return { coverage: scanCoverage(scan), gaps: uncovered(scan), state }
 }
 
-export function startGapBackup(id: string, apiKeys: string[], selectedModels?: string[]) {
+export function startGapBackup(
+  id: string,
+  apiKeys: string[],
+  selectedModels?: string[],
+  selectedGaps?: Array<{ start: number; end: number }>,
+) {
   if (active.has(id)) return { ok: false, error: 'Missing-scene finder already running' }
   const scan = getScan(id)
   if (!scan) return { ok: false, error: 'Scan not found' }
@@ -134,11 +139,26 @@ export function startGapBackup(id: string, apiKeys: string[], selectedModels?: s
   for (const k of apiKeys) {
     void cleanupOrphanedGeminiFiles(k, 2 * 60 * 60_000)
   }
-  const gaps = uncovered(scan)
-  if (!gaps.length) return { ok: false, error: 'No true uncovered ranges remain' }
+  const allGaps = uncovered(scan)
+  if (!allGaps.length) return { ok: false, error: 'No true uncovered ranges remain' }
+
+  let gapsToSearch: ShortRange[] = allGaps
+  if (selectedGaps && selectedGaps.length > 0) {
+    const total = shortTotalOf(scan)
+    const valid = selectedGaps
+      .map((g) => ({
+        start: Math.max(0, Number(g.start)),
+        end: Math.min(total, Number(g.end)),
+      }))
+      .filter((g) => g.end - g.start >= 0.2)
+    if (valid.length > 0) {
+      gapsToSearch = valid
+    }
+  }
+
   const control = { stopping: false }
   active.set(id, control)
-  void runGapBackup(scan, apiKeys, gaps, control, selectedModels).finally(() => active.delete(id))
+  void runGapBackup(scan, apiKeys, gapsToSearch, control, selectedModels).finally(() => active.delete(id))
   return { ok: true }
 }
 

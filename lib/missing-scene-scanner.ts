@@ -14,7 +14,7 @@ import {
 import { CHUNK_MODEL_POOL, VERIFY_MODEL_POOL } from './models'
 import { buildBackupClip, chunkPath, extractClipPrecise, sanitizeVideoMute } from './ffmpeg'
 import { localMediaPath, findAndReusePrescanMovie, findReusableGeminiMovieUpload, findAndReuseMovieChunks } from './media'
-import { addLog, getScan, saveScan, scanMediaDir, incrementModelUsage } from './store'
+import { addLog, getScan, saveScan, scanMediaDir, incrementModelUsage, apiKeyHash } from './store'
 import { gapsOf, mergeRanges } from './short-coverage'
 import { globalGeminiCoordinator } from './global-gemini-coordinator'
 import type { ChunkMatch, MissingSceneCandidate, MissingSceneScanState, MissingSceneTarget, MissingSceneWindowHit, Scan } from './types'
@@ -204,15 +204,15 @@ async function runMissingSceneScanner(
     // 2. Upload missing scene clip to Gemini Files API
     state.progress = 'Uploading missing scene clip to Gemini...'
     saveScan(scan)
-    const clipUpload = await uploadVideo(ai, clipOutFile, 'Missing Scene Short Clip')
+    const clipUpload = await uploadVideo(ai, clipOutFile)
     uploadedFilesToClean.push(clipUpload.name)
 
     // 3. Ensure movie copy is available
     let movieCopyPath = path.join(mediaDir, 'prescan-movie.mp4')
     if (!fs.existsSync(/*turbopackIgnore: true*/ movieCopyPath)) {
-      const reused = await findAndReusePrescanMovie(scanId, trimStart, trimEnd, mediaDir)
+      const reused = await findAndReusePrescanMovie(scanId, scan.movieName || '', scan.movieSize || 0, trimStart, trimEnd)
       if (reused) {
-        movieCopyPath = reused.path
+        movieCopyPath = reused.copyPath
       } else {
         // Fallback: use movieFile if no copy
         movieCopyPath = movieFile
@@ -233,11 +233,11 @@ async function runMissingSceneScanner(
         scanId,
       )
       if (reusableUpload) {
-        movieUploadUri = reusableUpload.uri
+        movieUploadUri = reusableUpload.movieUri
       } else {
         state.progress = 'Uploading movie copy to Gemini Files API...'
         saveScan(scan)
-        const up = await uploadVideo(ai, movieCopyPath, 'Prescan Movie Copy')
+        const up = await uploadVideo(ai, movieCopyPath)
         movieUploadUri = up.uri
         uploadedFilesToClean.push(up.name)
       }
@@ -321,7 +321,7 @@ PART <n>: NOT FOUND — not in this 20-minute window`
         })
         releaseGlobalLock = release
 
-        const runnerAi = selected.apiKey === primaryApiKey ? ai : new GoogleGenAI({ apiKey: selected.apiKey })
+        const runnerAi = selected.apiKey === primaryApiKey ? ai : getClient(selected.apiKey)
         let text = ''
         try {
           const resp = await runnerAi.models.generateContent({
@@ -330,7 +330,7 @@ PART <n>: NOT FOUND — not in this 20-minute window`
               {
                 role: 'user',
                 parts: [
-                  { fileData: { fileUri: clipUpload.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 10 } },
+                  { fileData: { fileUri: clipUpload.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 24 } },
                   {
                     fileData: { fileUri: movieUploadUri, mimeType: 'video/mp4' },
                     videoMetadata: { fps: 1, startOffset: `${Math.round(win.start)}s`, endOffset: `${Math.round(win.end)}s` },
@@ -362,9 +362,9 @@ PART <n>: NOT FOUND — not in this 20-minute window`
             fs.mkdirSync(sanitizedDir, { recursive: true })
             const sanitizedClipFile = path.join(sanitizedDir, 'missing-scenes-clip-muted.mp4')
             if (!fs.existsSync(sanitizedClipFile)) {
-              await sanitizeVideoMute(clipFile, sanitizedClipFile)
+              await sanitizeVideoMute(clipOutFile, sanitizedClipFile)
             }
-            const sanitizedUp = await uploadVideo(runnerAi, sanitizedClipFile, 'Missing Scenes Clip Sanitized')
+            const sanitizedUp = await uploadVideo(runnerAi, sanitizedClipFile)
             uploadedFilesToClean.push(sanitizedUp.name)
 
             const sanitizedWindowPrompt = `Analyze visual scene alignment between Video 1 and Video 2 (silent forensic matching).
@@ -381,7 +381,7 @@ PART <number>: NOT FOUND`
                   {
                     role: 'user',
                     parts: [
-                      { fileData: { fileUri: sanitizedUp.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 10 } },
+                      { fileData: { fileUri: sanitizedUp.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 24 } },
                       {
                         fileData: { fileUri: movieUploadUri, mimeType: 'video/mp4' },
                         videoMetadata: { fps: 1, startOffset: `${Math.round(win.start)}s`, endOffset: `${Math.round(win.end)}s` },
@@ -484,7 +484,7 @@ PART <number>: NOT FOUND`
     addLog(scan, 'info', `[Missing Scene Finder] Found ${candidateMinutes.size} candidate minute(s): [${Array.from(candidateMinutes).join(', ')}]. Slicing chunks and searching...`)
 
     // Reuse existing chunks from this scan or other scans
-    await findAndReuseMovieChunks(scanId, trimStart, trimEnd)
+    await findAndReuseMovieChunks(scanId, scan.movieName || '', scan.movieSize || 0, trimStart, trimEnd, scan.chunkCount || 0)
 
     const candidates: MissingSceneCandidate[] = []
 
@@ -505,7 +505,7 @@ PART <number>: NOT FOUND`
 
       // Upload chunk to Gemini
       try {
-        const up = await uploadVideo(ai, chunkFile, `Movie Chunk ${chunkIdx + 1}`)
+        const up = await uploadVideo(ai, chunkFile)
         uploadedFilesToClean.push(up.name)
 
         const chunkPrompt = `You are a forensic video analyst.
@@ -527,8 +527,8 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
 
         let releaseChunkLock: ((sec?: number) => void) | null = null
         try {
-          const apiKeys = scan.apiKeys && scan.apiKeys.length > 0 ? scan.apiKeys : [primaryApiKey]
-          const candLanes = apiKeys.flatMap((k, ki) =>
+          const activeKeys = apiKeys && apiKeys.length > 0 ? apiKeys : [primaryApiKey]
+          const candLanes = activeKeys.flatMap((k: string, ki: number) =>
             CHUNK_MODEL_POOL.map((m) => ({
               apiKey: k,
               keyIdx: ki + 1,
@@ -548,7 +548,7 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
           })
           releaseChunkLock = release
 
-          const runnerAi = selected.apiKey === primaryApiKey ? ai : new GoogleGenAI({ apiKey: selected.apiKey })
+          const runnerAi = selected.apiKey === primaryApiKey ? ai : getClient(selected.apiKey)
           let cText = ''
           try {
             const resp = await runnerAi.models.generateContent({
@@ -557,8 +557,8 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
                 {
                   role: 'user',
                   parts: [
-                    { fileData: { fileUri: clipUpload.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 10 } },
-                    { fileData: { fileUri: up.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 10 } },
+                    { fileData: { fileUri: clipUpload.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 24 } },
+                    { fileData: { fileUri: up.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 24 } },
                     { text: chunkPrompt },
                   ],
                 },
@@ -588,7 +588,7 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
               if (!fs.existsSync(sanitizedChunkFile)) {
                 await sanitizeVideoMute(chunkFile, sanitizedChunkFile)
               }
-              const sanitizedUp = await uploadVideo(runnerAi, sanitizedChunkFile, `Missing Chunk ${chunkIdx + 1} Sanitized`)
+              const sanitizedUp = await uploadVideo(runnerAi, sanitizedChunkFile)
               uploadedFilesToClean.push(sanitizedUp.name)
 
               try {
@@ -598,8 +598,8 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
                     {
                       role: 'user',
                       parts: [
-                        { fileData: { fileUri: clipUpload.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 10 } },
-                        { fileData: { fileUri: sanitizedUp.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 10 } },
+                        { fileData: { fileUri: clipUpload.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 24 } },
+                        { fileData: { fileUri: sanitizedUp.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 24 } },
                         { text: CHUNK_MAP_SANITIZED_PROMPT },
                       ],
                     },
@@ -649,7 +649,7 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
                 chunkIndex: chunkIdx,
                 movieStart: Math.max(0, Number(absMovieStart.toFixed(3))),
                 movieEnd: Number(absMovieEnd.toFixed(3)),
-                model,
+                model: selected.modelId,
                 status: 'pending',
               }
               candidates.push(cand)
@@ -694,15 +694,15 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
           await extractClipPrecise(shortFile, cand.shortStart, cand.shortEnd, vShortClip)
           await extractClipPrecise(movieFile, cand.movieStart, cand.movieEnd, vMovieClip)
 
-          const upShort = await uploadVideo(ai, vShortClip, `Verify Short ${cand.id}`)
-          const upMovie = await uploadVideo(ai, vMovieClip, `Verify Movie ${cand.id}`)
+          const upShort = await uploadVideo(ai, vShortClip)
+          const upMovie = await uploadVideo(ai, vMovieClip)
           uploadedFilesToClean.push(upShort.name, upMovie.name)
 
           const clipSec = Math.max(cand.shortEnd - cand.shortStart, cand.movieEnd - cand.movieStart, 5)
           let releaseVLock: ((sec?: number) => void) | null = null
           try {
-            const apiKeys = scan.apiKeys && scan.apiKeys.length > 0 ? scan.apiKeys : [primaryApiKey]
-            const candLanes = apiKeys.flatMap((k, ki) =>
+            const activeKeys = apiKeys && apiKeys.length > 0 ? apiKeys : [primaryApiKey]
+            const candLanes = activeKeys.flatMap((k: string, ki: number) =>
               VERIFY_MODEL_POOL.map((m) => ({
                 apiKey: k,
                 keyIdx: ki + 1,
@@ -722,7 +722,7 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
             })
             releaseVLock = release
 
-            const runnerAi = selected.apiKey === primaryApiKey ? ai : new GoogleGenAI({ apiKey: selected.apiKey })
+            const runnerAi = selected.apiKey === primaryApiKey ? ai : getClient(selected.apiKey)
             const vResp = await verifyRequest(runnerAi, selected.modelId, upShort.uri, upMovie.uri)
             const verdict = parseVerdict(vResp)
 
@@ -738,7 +738,6 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
                 shortEnd: cand.shortEnd,
                 movieStart: cand.movieStart,
                 movieEnd: cand.movieEnd,
-                confidence: 0.98,
                 reason: `Targeted missing scene verified at 24 fps (${cand.verifierReason})`,
                 model: cand.model,
                 verified: true,

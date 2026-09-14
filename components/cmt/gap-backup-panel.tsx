@@ -1,8 +1,8 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import useSWR from 'swr'
-import { AlertTriangle, Check, ChevronDown, ChevronRight, Circle, Loader2, Pause, Play, RotateCcw, Search, Square, X } from 'lucide-react'
+import { AlertTriangle, Check, ChevronDown, ChevronRight, Circle, Loader2, Pause, Play, Plus, RotateCcw, Search, Square, Trash2, X } from 'lucide-react'
 import type { GapBackupCandidate, GapBackupRequest, GapBackupState, Scan, ShortCoverage, ShortRange } from '@/lib/types'
 import { fetcher, fmtDuration, fmtTime } from '@/lib/format'
 import { displayModelName, GAP_FINDER_AVAILABLE_MODELS } from '@/lib/models'
@@ -195,6 +195,17 @@ function RequestRow({ request }: { request: GapBackupRequest }) {
   )
 }
 
+function parseTimestampToSec(val: string): number | null {
+  const clean = val.trim()
+  if (!clean) return null
+  if (/^\d+(\.\d+)?$/.test(clean)) return parseFloat(clean)
+  const parts = clean.split(':').map((p) => parseFloat(p))
+  if (parts.some((p) => isNaN(p))) return null
+  if (parts.length === 2) return parts[0] * 60 + parts[1]
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2]
+  return null
+}
+
 export function GapBackupPanel({ scan }: { scan: Scan }) {
   const { data, mutate } = useSWR<GapResponse>(`/api/scans/${scan.id}/gap-backup`, fetcher, { refreshInterval: 1200 })
   const [busy, setBusy] = useState(false)
@@ -206,16 +217,108 @@ export function GapBackupPanel({ scan }: { scan: Scan }) {
     'gemini-3.6-flash',
   ])
 
+  const [selectedGapKeys, setSelectedGapKeys] = useState<string[]>([])
+  const [customGaps, setCustomGaps] = useState<ShortRange[]>([])
+  const [customStart, setCustomStart] = useState('')
+  const [customEnd, setCustomEnd] = useState('')
+  const [customError, setCustomError] = useState<string | null>(null)
+  const [showCustomInput, setShowCustomInput] = useState(false)
+
   const preview = data ?? { coverage: scan.report?.coverage, gaps: [], state: scan.gapBackup, running: false }
   const coverage = preview.coverage
   const fallbackState: GapBackupState = { status: 'idle', parts: [], minutes: [], requests: [], candidates: [], addedMatches: [] }
   const rawState = preview.state ?? fallbackState
   const state = Array.isArray(rawState.minutes) && Array.isArray(rawState.requests) ? rawState : fallbackState
-  if (!coverage || (coverage.gaps.length === 0 && state.status === 'idle')) return null
   const running = Boolean(data?.running || ['cutting', 'uploading', 'searching'].includes(state.status))
   const currentPhase = PHASES.findIndex((phase) => phase.key === state.status)
   const pending = state.candidates.filter((candidate) => candidate.review === 'pending')
   const groupedRequests = state.minutes.map((minute) => ({ minute, requests: state.requests.filter((request) => request.minuteIndex === minute.index) }))
+
+  const allAvailableGaps = useMemo(
+    () => [
+      ...(coverage?.gaps || []).map((g, i) => ({
+        ...g,
+        key: `gap-${g.start.toFixed(2)}-${g.end.toFixed(2)}`,
+        label: `Gap #${i + 1}`,
+        isCustom: false,
+      })),
+      ...customGaps.map((g, i) => ({
+        ...g,
+        key: `custom-${g.start.toFixed(2)}-${g.end.toFixed(2)}`,
+        label: `Custom #${i + 1}`,
+        isCustom: true,
+      })),
+    ],
+    [coverage?.gaps, customGaps],
+  )
+
+  // Initialize selected gap keys when gaps become available
+  useEffect(() => {
+    if (allAvailableGaps.length > 0) {
+      setSelectedGapKeys((prev) => {
+        const availableKeys = allAvailableGaps.map((g) => g.key)
+        if (prev.length === 0) return availableKeys
+        const stillValid = prev.filter((k) => availableKeys.includes(k))
+        return stillValid.length > 0 ? stillValid : availableKeys
+      })
+    }
+  }, [allAvailableGaps])
+
+  if (!coverage || (coverage.gaps.length === 0 && state.status === 'idle')) return null
+
+  const toggleGap = (key: string) => {
+    setSelectedGapKeys((prev) =>
+      prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]
+    )
+  }
+
+  const selectAllGaps = () => {
+    setSelectedGapKeys(allAvailableGaps.map((g) => g.key))
+  }
+
+  const clearAllGaps = () => {
+    setSelectedGapKeys([])
+  }
+
+  const handleAddCustomGap = () => {
+    setCustomError(null)
+    const s = parseTimestampToSec(customStart)
+    const e = parseTimestampToSec(customEnd)
+    if (s === null || e === null) {
+      setCustomError('Timestamp format sahi nahi hai (e.g. 0:30 ya 1:15.5)')
+      return
+    }
+    if (s < 0) {
+      setCustomError('Start time negative nahi ho sakta')
+      return
+    }
+    if (e <= s) {
+      setCustomError('End time start time se bada hona chahiye')
+      return
+    }
+    if (e - s < 0.2) {
+      setCustomError('Scene duration kam se kam 0.2s honi chahiye')
+      return
+    }
+    const newGap: ShortRange = {
+      start: Number(s.toFixed(3)),
+      end: Number(e.toFixed(3)),
+    }
+    const newKey = `custom-${newGap.start.toFixed(2)}-${newGap.end.toFixed(2)}`
+    if (allAvailableGaps.some((g) => Math.abs(g.start - newGap.start) < 0.1 && Math.abs(g.end - newGap.end) < 0.1)) {
+      setCustomError('Yeh scene range pehle se list me maujood hai')
+      return
+    }
+    setCustomGaps((prev) => [...prev, newGap])
+    setSelectedGapKeys((prev) => [...prev, newKey])
+    setCustomStart('')
+    setCustomEnd('')
+  }
+
+  const handleRemoveCustomGap = (key: string) => {
+    setCustomGaps((prev) => prev.filter((g) => `custom-${g.start.toFixed(2)}-${g.end.toFixed(2)}` !== key))
+    setSelectedGapKeys((prev) => prev.filter((k) => k !== key))
+  }
 
   const toggleModel = (id: string) => {
     setSelectedModels((prev) =>
@@ -231,7 +334,13 @@ export function GapBackupPanel({ scan }: { scan: Scan }) {
     setSelectedModels(['gemini-3.7-flash', 'gemini-3.8-flash', 'gemini-3.6-flash'])
   }
 
+  const chosenGaps = allAvailableGaps.filter((g) => selectedGapKeys.includes(g.key))
+
   async function action(actionName: 'start' | 'stop' | 'accept' | 'reject', candidateId?: string) {
+    if (actionName === 'start' && chosenGaps.length === 0) {
+      setError('Kripya search karne ke liye kam se kam 1 missing scene choose karein')
+      return
+    }
     if (actionName === 'start' && selectedModels.length === 0) {
       setError('Kam se kam 1 model choose karein')
       return
@@ -244,7 +353,11 @@ export function GapBackupPanel({ scan }: { scan: Scan }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(
           actionName === 'start'
-            ? { action: 'start', models: selectedModels }
+            ? {
+                action: 'start',
+                models: selectedModels,
+                selectedGaps: chosenGaps.map((g) => ({ start: g.start, end: g.end })),
+              }
             : { action: actionName, candidateId }
         ),
       })
@@ -270,8 +383,142 @@ export function GapBackupPanel({ scan }: { scan: Scan }) {
         <span className="ml-auto font-mono text-xs text-muted-foreground">{coverage.missingSec.toFixed(1)}s missing</span>
       </div>
 
-      <div className="mt-4 flex flex-wrap gap-2">
-        {coverage.gaps.map((gap) => <span key={`${gap.start}-${gap.end}`} className="rounded-md border border-warning/30 bg-warning/10 px-2 py-1 font-mono text-xs text-warning">{fmtTime(gap.start)}–{fmtTime(gap.end)}</span>)}
+      {/* MISSING SCENE SELECTOR */}
+      <div className="mt-4 rounded-lg border border-warning/30 bg-background/70 p-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-semibold text-foreground">
+              Select Missing Scene(s) to search ({chosenGaps.length} of {allAvailableGaps.length} selected):
+            </span>
+          </div>
+          <div className="flex items-center gap-2 text-[11px]">
+            <button
+              type="button"
+              onClick={selectAllGaps}
+              disabled={running}
+              className="text-primary hover:underline disabled:opacity-50"
+            >
+              Select All ({allAvailableGaps.length})
+            </button>
+            <span className="text-muted-foreground">·</span>
+            <button
+              type="button"
+              onClick={clearAllGaps}
+              disabled={running}
+              className="text-muted-foreground hover:underline disabled:opacity-50"
+            >
+              Clear
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+          {allAvailableGaps.map((gap) => {
+            const isSelected = selectedGapKeys.includes(gap.key)
+            const duration = (gap.end - gap.start).toFixed(1)
+            return (
+              <div
+                key={gap.key}
+                onClick={() => !running && toggleGap(gap.key)}
+                className={`flex cursor-pointer items-center justify-between gap-2 rounded-md border p-2.5 text-xs transition-colors ${
+                  isSelected
+                    ? 'border-warning/60 bg-warning/10 text-foreground shadow-xs'
+                    : 'border-border/60 bg-muted/20 text-muted-foreground hover:border-border'
+                } ${running ? 'cursor-not-allowed opacity-80' : ''}`}
+              >
+                <div className="flex items-center gap-2 min-w-0">
+                  <input
+                    type="checkbox"
+                    checked={isSelected}
+                    disabled={running}
+                    onChange={() => toggleGap(gap.key)}
+                    onClick={(e) => e.stopPropagation()}
+                    className="size-3.5 rounded border-warning/80 text-warning focus:ring-warning"
+                  />
+                  <div className="min-w-0">
+                    <div className="font-mono font-semibold text-foreground">
+                      {fmtTime(gap.start)} – {fmtTime(gap.end)}
+                    </div>
+                    <div className="text-[11px] text-muted-foreground">
+                      Duration: {duration}s · {gap.label}
+                    </div>
+                  </div>
+                </div>
+                {gap.isCustom && !running && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      handleRemoveCustomGap(gap.key)
+                    }}
+                    title="Remove custom scene"
+                    className="p-1 text-muted-foreground hover:text-destructive"
+                  >
+                    <Trash2 className="size-3.5" />
+                  </button>
+                )}
+              </div>
+            )
+          })}
+        </div>
+
+        {/* CUSTOM SCENE TIMESTAMP ADDER */}
+        {!running && (
+          <div className="mt-3 border-t border-border/60 pt-2.5">
+            {!showCustomInput ? (
+              <button
+                type="button"
+                onClick={() => setShowCustomInput(true)}
+                className="flex items-center gap-1 text-[11px] font-medium text-primary hover:underline"
+              >
+                <Plus className="size-3" />
+                Or Add Custom Missing Scene Timestamp
+              </button>
+            ) : (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-medium text-foreground">Add Custom Missing Scene:</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowCustomInput(false)
+                      setCustomError(null)
+                    }}
+                    className="text-[11px] text-muted-foreground hover:text-foreground"
+                  >
+                    Cancel
+                  </button>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <input
+                    type="text"
+                    placeholder="Start (e.g. 0:30)"
+                    value={customStart}
+                    onChange={(e) => setCustomStart(e.target.value)}
+                    className="h-7 w-28 rounded border border-border bg-background px-2 font-mono text-xs"
+                  />
+                  <span className="text-xs text-muted-foreground">to</span>
+                  <input
+                    type="text"
+                    placeholder="End (e.g. 0:40)"
+                    value={customEnd}
+                    onChange={(e) => setCustomEnd(e.target.value)}
+                    className="h-7 w-28 rounded border border-border bg-background px-2 font-mono text-xs"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleAddCustomGap}
+                    className="flex h-7 items-center gap-1 rounded bg-secondary px-2.5 text-xs font-medium text-secondary-foreground hover:bg-secondary/80"
+                  >
+                    <Plus className="size-3" />
+                    Add Scene
+                  </button>
+                </div>
+                {customError && <p className="text-[11px] text-destructive">{customError}</p>}
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* MODEL SELECTION CONTROLS */}
@@ -347,9 +594,16 @@ export function GapBackupPanel({ scan }: { scan: Scan }) {
 
       <div className="mt-4 flex flex-wrap items-center gap-2">
         {!running ? (
-          <button type="button" onClick={() => void action('start')} disabled={busy || pending.length > 0 || selectedModels.length === 0} className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-xs font-medium text-primary-foreground disabled:opacity-50">
+          <button
+            type="button"
+            onClick={() => void action('start')}
+            disabled={busy || pending.length > 0 || selectedModels.length === 0 || chosenGaps.length === 0}
+            className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-xs font-medium text-primary-foreground disabled:opacity-50"
+          >
             {busy ? <Loader2 className="size-3.5 animate-spin" aria-hidden /> : state.status === 'idle' ? <Search className="size-3.5" aria-hidden /> : <RotateCcw className="size-3.5" aria-hidden />}
-            {state.status === 'idle' ? `Find missing scenes (${selectedModels.length} models)` : `Retry unresolved ranges (${selectedModels.length} models)`}
+            {state.status === 'idle'
+              ? `Find missing scenes (${chosenGaps.length} scene${chosenGaps.length === 1 ? '' : 's'}, ${selectedModels.length} models)`
+              : `Retry missing scenes (${chosenGaps.length} scene${chosenGaps.length === 1 ? '' : 's'}, ${selectedModels.length} models)`}
           </button>
         ) : (
           <button type="button" onClick={() => void action('stop')} disabled={busy} className="flex items-center gap-1.5 rounded-md border border-destructive/40 px-3 py-2 text-xs font-medium text-destructive"><Square className="size-3.5 fill-current" aria-hidden /> Stop finder</button>
