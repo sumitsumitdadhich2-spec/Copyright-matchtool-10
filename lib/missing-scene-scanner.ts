@@ -157,7 +157,46 @@ async function runMissingSceneScanner(
   saveScan(scan)
   addLog(scan, 'info', `[Missing Scene Finder] Initialized for ${targets.length} scene(s): ${targets.map((t) => `${fmtTime(t.shortStart)}–${fmtTime(t.shortEnd)}`).join(', ')}`)
 
-  const primaryApiKey = apiKeys[0]
+  // Pick the best key: prefer an API key that ALREADY has the movie uploaded and active on Gemini!
+  let chosenApiKey = apiKeys[0]
+  let existingMovieUri: string | undefined = undefined
+
+  // 1. Check current scan's geminiPrescan.uploads
+  if (scan.geminiPrescan?.uploads) {
+    for (const k of apiKeys) {
+      const kh = apiKeyHash(k)
+      const up = scan.geminiPrescan.uploads[kh]
+      if (up?.movieUri && up?.movieName && Date.now() - (up.uploadedAt || 0) < 47 * 3600 * 1000) {
+        chosenApiKey = k
+        existingMovieUri = up.movieUri
+        addLog(scan, 'info', `[Missing Scene Finder] Found active cached movie upload on key ${kh.slice(0, 8)} (0s movie upload wait)`)
+        break
+      }
+    }
+  }
+
+  // 2. If not found in current scan, check across all scans via findReusableGeminiMovieUpload
+  if (!existingMovieUri) {
+    for (const k of apiKeys) {
+      const kh = apiKeyHash(k)
+      const reusable = findReusableGeminiMovieUpload(
+        scan.movieName || '',
+        scan.movieSize || 0,
+        kh,
+        trimStart,
+        trimEnd,
+        scanId,
+      )
+      if (reusable?.movieUri) {
+        chosenApiKey = k
+        existingMovieUri = reusable.movieUri
+        addLog(scan, 'info', `[Missing Scene Finder] Reusing existing movie upload from scan ${reusable.sourceId} on key ${kh.slice(0, 8)} (0s movie upload wait)`)
+        break
+      }
+    }
+  }
+
+  const primaryApiKey = chosenApiKey
   const ai = getClient(primaryApiKey)
   const uploadedFilesToClean: string[] = []
 
@@ -204,53 +243,61 @@ async function runMissingSceneScanner(
     state.progress = 'Uploading missing scene clip to Gemini...'
     saveScan(scan)
     const onClipProgress = (p: UploadProgress) => {
-      state.progress = `Uploading missing scene clip (${p.pct}% @ ${p.speedStr})...`
+      const statusText = p.stage === 'processing'
+        ? `Google Gemini server processing clip (${p.speedStr})...`
+        : `Uploading missing scene clip (${p.pct}% @ ${p.speedStr})...`
+      state.progress = statusText
       saveScan(scan)
     }
     const clipUpload = await uploadVideo(ai, clipOutFile, onClipProgress, () => ctrl.stopping)
     uploadedFilesToClean.push(clipUpload.name)
 
-    // 3. Ensure movie copy is available
-    let movieCopyPath = path.join(mediaDir, 'prescan-movie.mp4')
-    if (!fs.existsSync(/*turbopackIgnore: true*/ movieCopyPath)) {
-      const reused = await findAndReusePrescanMovie(scanId, scan.movieName || '', scan.movieSize || 0, trimStart, trimEnd)
-      if (reused) {
-        movieCopyPath = reused.copyPath
-      } else {
-        state.progress = 'Preparing optimized movie copy for Gemini window scan...'
-        saveScan(scan)
-        const prep = await preparePrescanMovieCopy(movieFile, mediaDir, trimStart, trimEnd)
-        movieCopyPath = prep.path
-      }
-    }
-
-    // Check if movie copy is already on Gemini Files API
-    const primaryKeyId = apiKeyHash(primaryApiKey)
-    let movieUploadUri = scan.geminiPrescan?.uploads?.[primaryKeyId]?.movieUri
+    // 3. Ensure movie copy is available and uploaded on Gemini
+    let movieUploadUri = existingMovieUri
 
     if (!movieUploadUri) {
-      const reusableUpload = findReusableGeminiMovieUpload(
-        scan.movieName || '',
-        scan.movieSize || 0,
-        primaryKeyId,
-        trimStart,
-        trimEnd,
-        scanId,
-      )
-      if (reusableUpload) {
-        movieUploadUri = reusableUpload.movieUri
-        addLog(scan, 'info', `[Missing Scene Finder] Reusing existing movie copy upload on Gemini Files API`)
-      } else {
-        state.progress = 'Uploading movie copy to Gemini Files API...'
-        saveScan(scan)
-        const onMovieProgress = (p: UploadProgress) => {
-          state.progress = `Uploading movie copy (${p.pct}% @ ${p.speedStr})...`
+      let movieCopyPath = path.join(mediaDir, 'prescan-movie.mp4')
+      if (!fs.existsSync(/*turbopackIgnore: true*/ movieCopyPath)) {
+        const reused = await findAndReusePrescanMovie(scanId, scan.movieName || '', scan.movieSize || 0, trimStart, trimEnd)
+        if (reused) {
+          movieCopyPath = reused.copyPath
+        } else {
+          state.progress = 'Preparing optimized movie copy for Gemini window scan...'
           saveScan(scan)
+          const prep = await preparePrescanMovieCopy(movieFile, mediaDir, trimStart, trimEnd)
+          movieCopyPath = prep.path
         }
-        const up = await uploadVideo(ai, movieCopyPath, onMovieProgress, () => ctrl.stopping)
-        movieUploadUri = up.uri
-        uploadedFilesToClean.push(up.name)
       }
+
+      state.progress = 'Uploading movie copy to Gemini Files API...'
+      saveScan(scan)
+      const onMovieProgress = (p: UploadProgress) => {
+        const statusText = p.stage === 'processing'
+          ? `Google Gemini server transcoding & indexing movie (${p.speedStr})...`
+          : `Uploading movie copy (${p.pct}% @ ${p.speedStr})...`
+        state.progress = statusText
+        saveScan(scan)
+      }
+      const up = await uploadVideo(ai, movieCopyPath, onMovieProgress, () => ctrl.stopping)
+      movieUploadUri = up.uri
+      uploadedFilesToClean.push(up.name)
+
+      // Store in scan.geminiPrescan.uploads for instant reuse in subsequent runs
+      const kh = apiKeyHash(primaryApiKey)
+      if (!scan.geminiPrescan) {
+        scan.geminiPrescan = { status: 'idle', windowLen: 1200, uploads: {}, windows: [] }
+      }
+      if (!scan.geminiPrescan.uploads) {
+        scan.geminiPrescan.uploads = {}
+      }
+      scan.geminiPrescan.uploads[kh] = {
+        shortUri: '',
+        shortName: '',
+        movieUri: up.uri,
+        movieName: up.name,
+        uploadedAt: Date.now(),
+      }
+      saveScan(scan)
     }
 
     if (ctrl.stopping) return

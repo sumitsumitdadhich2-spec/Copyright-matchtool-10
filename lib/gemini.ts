@@ -288,12 +288,22 @@ async function uploadResumableWithProgress(
   // 3. Poll for ACTIVE state with a 20-minute deadline and resilient error handling
   let f = await ai.files.get({ name: uploadedFileName })
   const deadline = Date.now() + 20 * 60_000
+  const processingStart = Date.now()
 
   while (f.state === 'PROCESSING') {
     if (isStopping && isStopping()) throw new Error('Upload cancelled')
     if (Date.now() > deadline) {
       throw new GeminiError('other', 'File processing timed out (20 min exceeded)')
     }
+    const elapsedSec = Math.round((Date.now() - processingStart) / 1000)
+    onProgress?.({
+      bytesUploaded: fileSize,
+      totalBytes: fileSize,
+      pct: 100,
+      speedBps: 0,
+      speedStr: `Google Processing (${elapsedSec}s)`,
+      stage: 'processing',
+    })
     await new Promise((r) => setTimeout(r, 2500))
     try {
       f = await ai.files.get({ name: f.name! })
@@ -313,7 +323,7 @@ async function uploadResumableWithProgress(
     totalBytes: fileSize,
     pct: 100,
     speedBps: 0,
-    speedStr: 'ACTIVE',
+    speedStr: 'Ready (ACTIVE)',
     stage: 'done',
   })
 
@@ -363,10 +373,20 @@ export async function uploadVideo(
 
   let f = file
   const deadline = Date.now() + 20 * 60_000
+  const processingStart = Date.now()
   // FAST POLLING with 20m deadline: check every 2.5s until ACTIVE
   while (f.state === 'PROCESSING') {
     if (isStopping && isStopping()) throw new Error('Stopped')
     if (Date.now() > deadline) throw new GeminiError('other', 'File processing timed out (20 min exceeded)')
+    const elapsedSec = Math.round((Date.now() - processingStart) / 1000)
+    onProgress?.({
+      bytesUploaded: 1,
+      totalBytes: 1,
+      pct: 100,
+      speedBps: 0,
+      speedStr: `Google Processing (${elapsedSec}s)`,
+      stage: 'processing',
+    })
     await new Promise((r) => setTimeout(r, 2500))
     try {
       f = await ai.files.get({ name: f.name! })
@@ -379,6 +399,14 @@ export async function uploadVideo(
     const detail = errObj?.message ? ` (${errObj.message})` : ''
     throw new GeminiError('other', `File upload failed (state=${f.state}${detail})`)
   }
+  onProgress?.({
+    bytesUploaded: 1,
+    totalBytes: 1,
+    pct: 100,
+    speedBps: 0,
+    speedStr: 'Ready (ACTIVE)',
+    stage: 'done',
+  })
   return { uri: f.uri!, name: f.name! }
 }
 
