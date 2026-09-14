@@ -157,48 +157,49 @@ async function runMissingSceneScanner(
   saveScan(scan)
   addLog(scan, 'info', `[Missing Scene Finder] Initialized for ${targets.length} scene(s): ${targets.map((t) => `${fmtTime(t.shortStart)}–${fmtTime(t.shortEnd)}`).join(', ')}`)
 
-  // Pick the best key: prefer an API key that ALREADY has the movie uploaded and active on Gemini!
-  let chosenApiKey = apiKeys[0]
-  let existingMovieUri: string | undefined = undefined
-
+  // Find all active movie uploads across the user's keys
+  const keysWithMovie: Array<{ apiKey: string; keyIdx: number; movieUri: string; movieName: string }> = []
+  
   // 1. Check current scan's geminiPrescan.uploads
   if (scan.geminiPrescan?.uploads) {
-    for (const k of apiKeys) {
+    for (let i = 0; i < apiKeys.length; i++) {
+      const k = apiKeys[i]
       const kh = apiKeyHash(k)
       const up = scan.geminiPrescan.uploads[kh]
       if (up?.movieUri && up?.movieName && Date.now() - (up.uploadedAt || 0) < 47 * 3600 * 1000) {
-        chosenApiKey = k
-        existingMovieUri = up.movieUri
-        addLog(scan, 'info', `[Missing Scene Finder] Found active cached movie upload on key ${kh.slice(0, 8)} (0s movie upload wait)`)
-        break
+        keysWithMovie.push({ apiKey: k, keyIdx: i + 1, movieUri: up.movieUri, movieName: up.movieName })
       }
     }
   }
 
-  // 2. If not found in current scan, check across all scans via findReusableGeminiMovieUpload
-  if (!existingMovieUri) {
-    for (const k of apiKeys) {
-      const kh = apiKeyHash(k)
-      const reusable = findReusableGeminiMovieUpload(
-        scan.movieName || '',
-        scan.movieSize || 0,
-        kh,
-        trimStart,
-        trimEnd,
-        scanId,
-      )
-      if (reusable?.movieUri) {
-        chosenApiKey = k
-        existingMovieUri = reusable.movieUri
-        addLog(scan, 'info', `[Missing Scene Finder] Reusing existing movie upload from scan ${reusable.sourceId} on key ${kh.slice(0, 8)} (0s movie upload wait)`)
-        break
-      }
+  // 2. If any key still doesn't have an upload in this scan, check reusable from other scans
+  for (let i = 0; i < apiKeys.length; i++) {
+    const k = apiKeys[i]
+    if (keysWithMovie.some((x) => x.apiKey === k)) continue
+    const kh = apiKeyHash(k)
+    const reusable = findReusableGeminiMovieUpload(
+      scan.movieName || '',
+      scan.movieSize || 0,
+      kh,
+      trimStart,
+      trimEnd,
+      scanId,
+    )
+    if (reusable?.movieUri && reusable?.movieName) {
+      keysWithMovie.push({ apiKey: k, keyIdx: i + 1, movieUri: reusable.movieUri, movieName: reusable.movieName })
     }
   }
 
-  const primaryApiKey = chosenApiKey
-  const ai = getClient(primaryApiKey)
-  const uploadedFilesToClean: string[] = []
+  if (keysWithMovie.length > 0) {
+    addLog(
+      scan,
+      'info',
+      `[Missing Scene Finder] Found active cached movie upload on ${keysWithMovie.length} key(s) (0s movie upload wait)`,
+    )
+  }
+
+  const primaryApiKey = keysWithMovie[0]?.apiKey || apiKeys[0]
+  const uploadedFilesToClean: Array<{ key: string; name: string }> = []
 
   try {
     // 1. Cut the target short clip (single scene or merged multi-scene)
@@ -239,23 +240,33 @@ async function runMissingSceneScanner(
 
     if (ctrl.stopping) return
 
-    // 2. Upload missing scene clip to Gemini Files API
+    // Cache uploaded missing scene clip per API key so requests on any key have proper access permissions
+    const clipUploadsByKey = new Map<string, { uri: string; name: string }>()
+    async function getClipForApiKey(key: string, onProgress?: (p: UploadProgress) => void): Promise<{ uri: string; name: string }> {
+      const kh = apiKeyHash(key)
+      const existing = clipUploadsByKey.get(kh)
+      if (existing) return existing
+      const keyAi = getClient(key)
+      const up = await uploadVideo(keyAi, clipOutFile, onProgress, () => ctrl.stopping)
+      uploadedFilesToClean.push({ key, name: up.name })
+      clipUploadsByKey.set(kh, up)
+      return up
+    }
+
+    // 2. Ensure initial clip is uploaded to primary key
     state.progress = 'Uploading missing scene clip to Gemini...'
     saveScan(scan)
     const onClipProgress = (p: UploadProgress) => {
       const statusText = p.stage === 'processing'
-        ? `Google Gemini server processing clip (${p.speedStr})...`
+        ? `Google Gemini server processing clip (${p.speedStr})....`
         : `Uploading missing scene clip (${p.pct}% @ ${p.speedStr})...`
       state.progress = statusText
       saveScan(scan)
     }
-    const clipUpload = await uploadVideo(ai, clipOutFile, onClipProgress, () => ctrl.stopping)
-    uploadedFilesToClean.push(clipUpload.name)
+    await getClipForApiKey(primaryApiKey, onClipProgress)
 
-    // 3. Ensure movie copy is available and uploaded on Gemini
-    let movieUploadUri = existingMovieUri
-
-    if (!movieUploadUri) {
+    // 3. Ensure movie copy is available and uploaded on at least one key
+    if (keysWithMovie.length === 0) {
       let movieCopyPath = path.join(mediaDir, 'prescan-movie.mp4')
       if (!fs.existsSync(/*turbopackIgnore: true*/ movieCopyPath)) {
         const reused = await findAndReusePrescanMovie(scanId, scan.movieName || '', scan.movieSize || 0, trimStart, trimEnd)
@@ -278,9 +289,8 @@ async function runMissingSceneScanner(
         state.progress = statusText
         saveScan(scan)
       }
-      const up = await uploadVideo(ai, movieCopyPath, onMovieProgress, () => ctrl.stopping)
-      movieUploadUri = up.uri
-      uploadedFilesToClean.push(up.name)
+      const up = await uploadVideo(getClient(primaryApiKey), movieCopyPath, onMovieProgress, () => ctrl.stopping)
+      uploadedFilesToClean.push({ key: primaryApiKey, name: up.name })
 
       // Store in scan.geminiPrescan.uploads for instant reuse in subsequent runs
       const kh = apiKeyHash(primaryApiKey)
@@ -298,6 +308,7 @@ async function runMissingSceneScanner(
         uploadedAt: Date.now(),
       }
       saveScan(scan)
+      keysWithMovie.push({ apiKey: primaryApiKey, keyIdx: 1, movieUri: up.uri, movieName: up.name })
     }
 
     if (ctrl.stopping) return
@@ -346,7 +357,17 @@ PART <n>: NOT FOUND — not in this 20-minute window`
     const windowHits: MissingSceneWindowHit[] = []
     const candidateMinutes = new Set<number>()
 
-    // Run window scan
+    // Build candidate lanes across all keys that have the active movie upload
+    const windowCandLanes = keysWithMovie.flatMap((kw) =>
+      CHUNK_MODEL_POOL.map((m) => ({
+        apiKey: kw.apiKey,
+        keyIdx: kw.keyIdx,
+        modelId: m.id,
+        rpd: m.rpd,
+      })),
+    )
+
+    // Run window scan with retry handling
     let completedWindows = 0
     for (const win of windowsToScan) {
       if (ctrl.stopping) break
@@ -358,168 +379,200 @@ PART <n>: NOT FOUND — not in this 20-minute window`
       state.progress = `Scanning ${winLabel} (${completedWindows + 1}/${windowsToScan.length})...`
       saveScan(scan)
 
-      let releaseGlobalLock: ((sec?: number) => void) | null = null
-      try {
-        const candLanes = CHUNK_MODEL_POOL.map((m) => ({
-          apiKey: primaryApiKey,
-          keyIdx: 1,
-          modelId: m.id,
-          rpd: m.rpd,
-        }))
+      let windowSuccess = false
+      let winAttempt = 0
+      const maxWinAttempts = 6
 
-        const { selected, release } = await globalGeminiCoordinator.acquireFirstAvailableLane({
-          scanId,
-          scanTitle: scan.shortName || scanId,
-          candidates: candLanes,
-          operation: `Missing Scene ${winLabel}`,
-          videoSeconds: 60,
-          onWait: (msg) => addLog(scan, 'info', msg),
-          isStopping: () => ctrl.stopping,
-        })
-        releaseGlobalLock = release
+      while (!windowSuccess && winAttempt < maxWinAttempts) {
+        if (ctrl.stopping) break
+        winAttempt++
 
-        const runnerAi = selected.apiKey === primaryApiKey ? ai : getClient(selected.apiKey)
-        let text = ''
+        let releaseGlobalLock: ((sec?: number) => void) | null = null
         try {
-          const resp = await runnerAi.models.generateContent({
-            model: selected.modelId,
-            contents: [
-              {
-                role: 'user',
-                parts: [
-                  { fileData: { fileUri: clipUpload.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 24 } },
-                  {
-                    fileData: { fileUri: movieUploadUri, mimeType: 'video/mp4' },
-                    videoMetadata: { fps: 1, startOffset: `${Math.round(win.start)}s`, endOffset: `${Math.round(win.end)}s` },
-                  },
-                  { text: windowPrompt },
-                ],
-              },
-            ],
+          const { selected, release } = await globalGeminiCoordinator.acquireFirstAvailableLane({
+            scanId,
+            scanTitle: scan.shortName || scanId,
+            candidates: windowCandLanes,
+            operation: `Missing Scene ${winLabel}`,
+            videoSeconds: 60,
+            onWait: (msg) => addLog(scan, 'info', msg),
+            isStopping: () => ctrl.stopping,
           })
-          text = resp.text || ''
-          incrementModelUsage(selected.modelId, selected.apiKey)
-        } catch (reqErr) {
-          const re = classifyError(reqErr)
-          const isPolicyBlocked =
-            re.kind === 'policy_blocked' ||
-            /prohibited_content|blocked_by_safety|safety_ratings_blocked|prompt block reason/i.test(re.message)
+          releaseGlobalLock = release
 
-          if (isPolicyBlocked) {
+          const runnerAi = getClient(selected.apiKey)
+          const keyClip = await getClipForApiKey(selected.apiKey)
+          const kw = keysWithMovie.find((x) => apiKeyHash(x.apiKey) === apiKeyHash(selected.apiKey))
+          const movieUploadUri = kw ? kw.movieUri : keysWithMovie[0].movieUri
+
+          let text = ''
+          try {
+            const resp = await runnerAi.models.generateContent({
+              model: selected.modelId,
+              contents: [
+                {
+                  role: 'user',
+                  parts: [
+                    { fileData: { fileUri: keyClip.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 24 } },
+                    {
+                      fileData: { fileUri: movieUploadUri, mimeType: 'video/mp4' },
+                      videoMetadata: { fps: 1, startOffset: `${Math.round(win.start)}s`, endOffset: `${Math.round(win.end)}s` },
+                    },
+                    { text: windowPrompt },
+                  ],
+                },
+              ],
+            })
+            text = resp.text || ''
             incrementModelUsage(selected.modelId, selected.apiKey)
-            addLog(
-              scan,
-              'warn',
-              `[Missing Scene Finder] ${winLabel}: Flagged by Google Policy (PROHIBITED_CONTENT) on ${selected.modelId} — triggering 1 sanitized retry with Audio Stripped (-an Mute) + Neutral prompt...`,
-            )
-            saveScan(scan)
-
-            // Sanitize muted clip video
-            const sanitizedDir = path.join(mediaDir, 'sanitized')
-            fs.mkdirSync(sanitizedDir, { recursive: true })
-            const sanitizedClipFile = path.join(sanitizedDir, 'missing-scenes-clip-muted.mp4')
-            if (!fs.existsSync(sanitizedClipFile)) {
-              await sanitizeVideoMute(clipOutFile, sanitizedClipFile)
+          } catch (reqErr) {
+            const re = classifyError(reqErr)
+            if (re.kind === 'rate') {
+              globalGeminiCoordinator.reportRateLimit(selected.apiKey, selected.modelId)
+              addLog(
+                scan,
+                'warn',
+                `[Missing Scene Finder] ${winLabel}: 429 Rate limit on Key ${selected.keyIdx} (${selected.modelId}) — retrying window on next available lane (attempt ${winAttempt}/${maxWinAttempts})...`,
+              )
+              continue
             }
-            const sanitizedUp = await uploadVideo(runnerAi, sanitizedClipFile)
-            uploadedFilesToClean.push(sanitizedUp.name)
+            if (re.kind === 'rpd') {
+              globalGeminiCoordinator.reportExhausted(selected.apiKey, selected.modelId)
+              addLog(
+                scan,
+                'warn',
+                `[Missing Scene Finder] ${winLabel}: Daily quota exhausted on Key ${selected.keyIdx} (${selected.modelId}) — switching lane...`,
+              )
+              continue
+            }
 
-            const sanitizedWindowPrompt = `Analyze visual scene alignment between Video 1 and Video 2 (silent forensic matching).
+            const isPolicyBlocked =
+              re.kind === 'policy_blocked' ||
+              /prohibited_content|blocked_by_safety|safety_ratings_blocked|prompt block reason/i.test(re.message)
+
+            if (isPolicyBlocked) {
+              incrementModelUsage(selected.modelId, selected.apiKey)
+              addLog(
+                scan,
+                'warn',
+                `[Missing Scene Finder] ${winLabel}: Flagged by Google Policy (PROHIBITED_CONTENT) on ${selected.modelId} — triggering 1 sanitized retry with Audio Stripped (-an Mute) + Neutral prompt...`,
+              )
+              saveScan(scan)
+
+              // Sanitize muted clip video
+              const sanitizedDir = path.join(mediaDir, 'sanitized')
+              fs.mkdirSync(sanitizedDir, { recursive: true })
+              const sanitizedClipFile = path.join(sanitizedDir, 'missing-scenes-clip-muted.mp4')
+              if (!fs.existsSync(sanitizedClipFile)) {
+                await sanitizeVideoMute(clipOutFile, sanitizedClipFile)
+              }
+              const sanitizedUp = await uploadVideo(runnerAi, sanitizedClipFile)
+              uploadedFilesToClean.push({ key: selected.apiKey, name: sanitizedUp.name })
+
+              const sanitizedWindowPrompt = `Analyze visual scene alignment between Video 1 and Video 2 (silent forensic matching).
 For each PART in Video 1:
 If visual match occurs in Video 2, report:
 PART <number> MATCH: Movie Minute <N> (around <mm:ss> - <mm:ss>)
 If not found, report:
 PART <number>: NOT FOUND`
 
-            try {
-              const sanitizedResp = await runnerAi.models.generateContent({
-                model: selected.modelId,
-                contents: [
-                  {
-                    role: 'user',
-                    parts: [
-                      { fileData: { fileUri: sanitizedUp.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 24 } },
-                      {
-                        fileData: { fileUri: movieUploadUri, mimeType: 'video/mp4' },
-                        videoMetadata: { fps: 1, startOffset: `${Math.round(win.start)}s`, endOffset: `${Math.round(win.end)}s` },
-                      },
-                      { text: sanitizedWindowPrompt },
-                    ],
-                  },
-                ],
-              })
-              text = sanitizedResp.text || ''
-              incrementModelUsage(selected.modelId, selected.apiKey)
-              addLog(scan, 'success', `[Missing Scene Finder] ${winLabel}: Sanitized retry succeeded after policy flag bypass`)
-            } catch (retryErr) {
-              const retryRe = classifyError(retryErr)
-              if (retryRe.kind === 'policy_blocked') {
+              try {
+                const sanitizedResp = await runnerAi.models.generateContent({
+                  model: selected.modelId,
+                  contents: [
+                    {
+                      role: 'user',
+                      parts: [
+                        { fileData: { fileUri: sanitizedUp.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 24 } },
+                        {
+                          fileData: { fileUri: movieUploadUri, mimeType: 'video/mp4' },
+                          videoMetadata: { fps: 1, startOffset: `${Math.round(win.start)}s`, endOffset: `${Math.round(win.end)}s` },
+                        },
+                        { text: sanitizedWindowPrompt },
+                      ],
+                    },
+                  ],
+                })
+                text = sanitizedResp.text || ''
                 incrementModelUsage(selected.modelId, selected.apiKey)
+                addLog(scan, 'success', `[Missing Scene Finder] ${winLabel}: Sanitized retry succeeded after policy flag bypass`)
+              } catch (retryErr) {
+                const retryRe = classifyError(retryErr)
+                if (retryRe.kind === 'rate') {
+                  globalGeminiCoordinator.reportRateLimit(selected.apiKey, selected.modelId)
+                  continue
+                }
+                if (retryRe.kind === 'policy_blocked') {
+                  incrementModelUsage(selected.modelId, selected.apiKey)
+                }
+                throw retryErr
               }
-              throw retryErr
-            }
-          } else {
-            throw reqErr
-          }
-        }
-
-        completedWindows++
-
-        // Parse matches
-        const lines = text.split('\n')
-        for (const line of lines) {
-          const matchRegex = /PART\s*(\d+).*?(?:MATCH|FOUND)/i
-          const partMatch = line.match(matchRegex)
-          if (partMatch) {
-            const partNum = parseInt(partMatch[1], 10)
-            const scenePart = sceneParts.find((p) => p.partNum === partNum) || sceneParts[0]
-
-            let foundMinute: number | null = null
-            const minRegex = /Movie Minute\s*:\s*(\d+)/i
-            const minM = line.match(minRegex)
-            if (minM) {
-              foundMinute = parseInt(minM[1], 10)
             } else {
-              const timeRegex = /(\d{1,2}:\d{2}(?:\.\d+)?)\s*-\s*(\d{1,2}:\d{2}(?:\.\d+)?)/
-              const timeM = line.match(timeRegex)
-              if (timeM) {
-                const parsedT = parseTs(timeM[1])
-                if (parsedT !== null) {
-                  const absSec = parsedT < win.end ? winStartAbs + parsedT : parsedT
-                  foundMinute = Math.floor(absSec / 60)
+              throw reqErr
+            }
+          }
+
+          windowSuccess = true
+          completedWindows++
+
+          // Parse matches
+          const lines = text.split('\n')
+          for (const line of lines) {
+            const matchRegex = /PART\s*(\d+).*?(?:MATCH|FOUND)/i
+            const partMatch = line.match(matchRegex)
+            if (partMatch) {
+              const partNum = parseInt(partMatch[1], 10)
+              const scenePart = sceneParts.find((p) => p.partNum === partNum) || sceneParts[0]
+
+              let foundMinute: number | null = null
+              const minRegex = /Movie Minute\s*:\s*(\d+)/i
+              const minM = line.match(minRegex)
+              if (minM) {
+                foundMinute = parseInt(minM[1], 10)
+              } else {
+                const timeRegex = /(\d{1,2}:\d{2}(?:\.\d+)?)\s*-\s*(\d{1,2}:\d{2}(?:\.\d+)?)/
+                const timeM = line.match(timeRegex)
+                if (timeM) {
+                  const parsedT = parseTs(timeM[1])
+                  if (parsedT !== null) {
+                    const absSec = parsedT < win.end ? winStartAbs + parsedT : parsedT
+                    foundMinute = Math.floor(absSec / 60)
+                  }
                 }
               }
-            }
 
-            if (foundMinute !== null && foundMinute >= 0) {
-              candidateMinutes.add(foundMinute)
-              const hit: MissingSceneWindowHit = {
-                windowIndex: win.index,
-                windowStart: winStartAbs,
-                windowEnd: winEndAbs,
-                movieMinute: foundMinute,
-                sceneId: scenePart.target.id,
-                shortStart: scenePart.target.shortStart,
-                shortEnd: scenePart.target.shortEnd,
-                evidence: line.slice(0, 150),
-                confidence: line.includes('HIGH') ? 'HIGH' : 'MEDIUM',
+              if (foundMinute !== null && foundMinute >= 0) {
+                candidateMinutes.add(foundMinute)
+                const hit: MissingSceneWindowHit = {
+                  windowIndex: win.index,
+                  windowStart: winStartAbs,
+                  windowEnd: winEndAbs,
+                  movieMinute: foundMinute,
+                  sceneId: scenePart.target.id,
+                  shortStart: scenePart.target.shortStart,
+                  shortEnd: scenePart.target.shortEnd,
+                  evidence: line.slice(0, 150),
+                  confidence: line.includes('HIGH') ? 'HIGH' : 'MEDIUM',
+                }
+                windowHits.push(hit)
+                state.windowHits = [...windowHits]
+                saveScan(scan)
+                addLog(
+                  scan,
+                  'success',
+                  `[Missing Scene Finder] ${winLabel}: Found scene ${fmtTime(scenePart.target.shortStart)}–${fmtTime(scenePart.target.shortEnd)} in Movie Minute ${foundMinute}!`,
+                )
               }
-              windowHits.push(hit)
-              state.windowHits = [...windowHits]
-              saveScan(scan)
-              addLog(
-                scan,
-                'success',
-                `[Missing Scene Finder] ${winLabel}: Found scene ${fmtTime(scenePart.target.shortStart)}–${fmtTime(scenePart.target.shortEnd)} in Movie Minute ${foundMinute}!`,
-              )
             }
           }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          if (winAttempt >= maxWinAttempts) {
+            addLog(scan, 'warn', `[Missing Scene Finder] ${winLabel} failed after ${maxWinAttempts} attempts: ${msg.slice(0, 120)}`)
+          }
+        } finally {
+          if (releaseGlobalLock) releaseGlobalLock(60)
         }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        addLog(scan, 'warn', `[Missing Scene Finder] ${winLabel} failed: ${msg.slice(0, 120)}`)
-      } finally {
-        if (releaseGlobalLock) releaseGlobalLock(60)
       }
     }
 
@@ -534,7 +587,7 @@ PART <number>: NOT FOUND`
       return
     }
 
-    // 5. Chunk Scan for detected minutes
+    // 5. Chunk Scan for detected minutes (using all active API keys with zero 403 errors)
     state.status = 'scanning_chunks'
     state.progress = `Scanning 1-minute chunks for ${candidateMinutes.size} candidate minute(s)...`
     saveScan(scan)
@@ -544,6 +597,15 @@ PART <number>: NOT FOUND`
     await findAndReuseMovieChunks(scanId, scan.movieName || '', scan.movieSize || 0, trimStart, trimEnd, scan.chunkCount || 0)
 
     const candidates: MissingSceneCandidate[] = []
+    const activeKeys = apiKeys && apiKeys.length > 0 ? apiKeys : [primaryApiKey]
+    const chunkCandLanes = activeKeys.flatMap((k: string, ki: number) =>
+      CHUNK_MODEL_POOL.map((m) => ({
+        apiKey: k,
+        keyIdx: ki + 1,
+        modelId: m.id,
+        rpd: m.rpd,
+      })),
+    )
 
     for (const minute of Array.from(candidateMinutes)) {
       if (ctrl.stopping) break
@@ -560,12 +622,35 @@ PART <number>: NOT FOUND`
         await extractClipPrecise(movieFile, chunkStart, chunkEnd, chunkFile)
       }
 
-      // Upload chunk to Gemini
-      try {
-        const up = await uploadVideo(ai, chunkFile)
-        uploadedFilesToClean.push(up.name)
+      let chunkSuccess = false
+      let chunkAttempt = 0
+      const maxChunkAttempts = 5
 
-        const chunkPrompt = `You are a forensic video analyst.
+      while (!chunkSuccess && chunkAttempt < maxChunkAttempts) {
+        if (ctrl.stopping) break
+        chunkAttempt++
+
+        let releaseChunkLock: ((sec?: number) => void) | null = null
+        try {
+          const { selected, release } = await globalGeminiCoordinator.acquireFirstAvailableLane({
+            scanId,
+            scanTitle: scan.shortName || scanId,
+            candidates: chunkCandLanes,
+            operation: `Missing Scene Chunk ${chunkIdx + 1} Map`,
+            videoSeconds: 60,
+            onWait: (msg) => addLog(scan, 'info', msg),
+            isStopping: () => ctrl.stopping,
+          })
+          releaseChunkLock = release
+
+          const runnerAi = getClient(selected.apiKey)
+          const keyClip = await getClipForApiKey(selected.apiKey)
+
+          // Upload chunk file directly under the selected API key to guarantee 100% permission access
+          const up = await uploadVideo(runnerAi, chunkFile)
+          uploadedFilesToClean.push({ key: selected.apiKey, name: up.name })
+
+          const chunkPrompt = `You are a forensic video analyst.
 - Video 1: Missing scene clip from the short video:
 ${partMapText}
 
@@ -582,30 +667,6 @@ Short mm:ss.mmm - mm:ss.mmm --> Movie mm:ss.mmm - mm:ss.mmm
 or:
 Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
 
-        let releaseChunkLock: ((sec?: number) => void) | null = null
-        try {
-          const activeKeys = apiKeys && apiKeys.length > 0 ? apiKeys : [primaryApiKey]
-          const candLanes = activeKeys.flatMap((k: string, ki: number) =>
-            CHUNK_MODEL_POOL.map((m) => ({
-              apiKey: k,
-              keyIdx: ki + 1,
-              modelId: m.id,
-              rpd: m.rpd,
-            })),
-          )
-
-          const { selected, release } = await globalGeminiCoordinator.acquireFirstAvailableLane({
-            scanId,
-            scanTitle: scan.shortName || scanId,
-            candidates: candLanes,
-            operation: `Missing Scene Chunk ${chunkIdx + 1} Map`,
-            videoSeconds: 60,
-            onWait: (msg) => addLog(scan, 'info', msg),
-            isStopping: () => ctrl.stopping,
-          })
-          releaseChunkLock = release
-
-          const runnerAi = selected.apiKey === primaryApiKey ? ai : getClient(selected.apiKey)
           let cText = ''
           try {
             const resp = await runnerAi.models.generateContent({
@@ -614,7 +675,7 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
                 {
                   role: 'user',
                   parts: [
-                    { fileData: { fileUri: clipUpload.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 24 } },
+                    { fileData: { fileUri: keyClip.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 24 } },
                     { fileData: { fileUri: up.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 24 } },
                     { text: chunkPrompt },
                   ],
@@ -624,13 +685,32 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
             cText = resp.text || ''
             incrementModelUsage(selected.modelId, selected.apiKey)
           } catch (reqErr) {
-            incrementModelUsage(selected.modelId, selected.apiKey)
             const re = classifyError(reqErr)
+            if (re.kind === 'rate') {
+              globalGeminiCoordinator.reportRateLimit(selected.apiKey, selected.modelId)
+              addLog(
+                scan,
+                'warn',
+                `[Missing Scene Finder] Chunk ${chunkIdx + 1}: 429 Rate limit on Key ${selected.keyIdx} (${selected.modelId}) — retrying chunk on next available lane (attempt ${chunkAttempt}/${maxChunkAttempts})...`,
+              )
+              continue
+            }
+            if (re.kind === 'rpd') {
+              globalGeminiCoordinator.reportExhausted(selected.apiKey, selected.modelId)
+              addLog(
+                scan,
+                'warn',
+                `[Missing Scene Finder] Chunk ${chunkIdx + 1}: Daily quota exhausted on Key ${selected.keyIdx} (${selected.modelId}) — switching lane...`,
+              )
+              continue
+            }
+
             const isPolicyBlocked =
               re.kind === 'policy_blocked' ||
               /prohibited_content|blocked_by_safety|safety_ratings_blocked|prompt block reason/i.test(re.message)
 
             if (isPolicyBlocked) {
+              incrementModelUsage(selected.modelId, selected.apiKey)
               addLog(
                 scan,
                 'warn',
@@ -646,7 +726,7 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
                 await sanitizeVideoMute(chunkFile, sanitizedChunkFile)
               }
               const sanitizedUp = await uploadVideo(runnerAi, sanitizedChunkFile)
-              uploadedFilesToClean.push(sanitizedUp.name)
+              uploadedFilesToClean.push({ key: selected.apiKey, name: sanitizedUp.name })
 
               try {
                 const sanitizedResp = await runnerAi.models.generateContent({
@@ -655,7 +735,7 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
                     {
                       role: 'user',
                       parts: [
-                        { fileData: { fileUri: clipUpload.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 24 } },
+                        { fileData: { fileUri: keyClip.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 24 } },
                         { fileData: { fileUri: sanitizedUp.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 24 } },
                         { text: CHUNK_MAP_SANITIZED_PROMPT },
                       ],
@@ -666,6 +746,11 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
                 incrementModelUsage(selected.modelId, selected.apiKey)
                 addLog(scan, 'success', `[Missing Scene Finder] Chunk ${chunkIdx + 1}: Sanitized retry succeeded after policy flag bypass`)
               } catch (retryErr) {
+                const retryRe = classifyError(retryErr)
+                if (retryRe.kind === 'rate') {
+                  globalGeminiCoordinator.reportRateLimit(selected.apiKey, selected.modelId)
+                  continue
+                }
                 incrementModelUsage(selected.modelId, selected.apiKey)
                 throw retryErr
               }
@@ -673,6 +758,8 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
               throw reqErr
             }
           }
+
+          chunkSuccess = true
           const mapRegex = /(\d{1,2}:\d{2}(?:\.\d+)?)\s*-\s*(\d{1,2}:\d{2}(?:\.\d+)?)\s*-->\s*(?:Movie\s*)?(\d{1,2}:\d{2}(?:\.\d+)?)\s*-\s*(\d{1,2}:\d{2}(?:\.\d+)?)/gi
           let match: RegExpExecArray | null
 
@@ -719,18 +806,20 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
               )
             }
           }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          if (chunkAttempt >= maxChunkAttempts) {
+            addLog(scan, 'warn', `[Missing Scene Finder] Chunk ${chunkIdx + 1} mapping error: ${msg.slice(0, 120)}`)
+          }
         } finally {
           if (releaseChunkLock) releaseChunkLock(60)
         }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        addLog(scan, 'warn', `[Missing Scene Finder] Chunk ${chunkIdx + 1} mapping error: ${msg.slice(0, 120)}`)
       }
     }
 
     if (ctrl.stopping) return
 
-    // 6. Finish scan - manual user review (verifier removed as requested)
+    // 6. Finish scan - manual user review
     state.status = 'done'
     state.progress = candidates.length > 0
       ? `Scan finished! ${candidates.length} candidate match(es) found — review and accept/reject below.`
@@ -750,9 +839,10 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
     saveScan(scan)
     addLog(scan, 'error', `[Missing Scene Finder] Error: ${msg}`)
   } finally {
-    // Clean up uploaded Gemini files
-    for (const name of uploadedFilesToClean) {
-      void deleteFileQuiet(ai, name).catch(() => {})
+    // Clean up uploaded Gemini files across all keys used
+    for (const item of uploadedFilesToClean) {
+      const client = getClient(item.key)
+      void deleteFileQuiet(client, item.name).catch(() => {})
     }
   }
 }
