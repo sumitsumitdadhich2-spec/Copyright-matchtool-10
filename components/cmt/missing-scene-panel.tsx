@@ -355,34 +355,104 @@ export function MissingScenePanel({ scan }: { scan: Scan }) {
 
       {/* ACTIVE STATUS & PROGRESS */}
       {state && state.status !== 'idle' && (
-        <div className="mt-4 rounded-lg border border-border bg-background p-3">
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-xs font-semibold text-foreground">Scanner Status:</span>
-            <span className="font-mono text-[11px] uppercase tracking-wide text-primary">
-              {state.status.replace(/_/g, ' ')}
-            </span>
+        <div className="mt-4 rounded-xl border border-primary/20 bg-background/80 p-3.5 shadow-xs">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-semibold text-foreground">Scanner Status:</span>
+              <span className="inline-flex items-center gap-1 rounded-md bg-primary/10 px-2 py-0.5 font-mono text-[11px] font-medium uppercase tracking-wide text-primary">
+                {isRunning && <Loader2 className="size-3 animate-spin" aria-hidden />}
+                {state.status.replace(/_/g, ' ')}
+              </span>
+            </div>
+
+            {/* Parallel worker indicators */}
+            {isRunning && (
+              <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                {(state.activeWindows || 0) > 0 && (
+                  <span className="rounded-full bg-blue-500/10 px-2 py-0.5 font-mono font-medium text-blue-600 dark:text-blue-400">
+                    ⚡ {state.activeWindows} Windows Active
+                  </span>
+                )}
+                {(state.activeChunks || 0) > 0 && (
+                  <span className="rounded-full bg-amber-500/10 px-2 py-0.5 font-mono font-medium text-amber-600 dark:text-amber-400">
+                    🚀 {state.activeChunks} Chunks Active
+                  </span>
+                )}
+              </div>
+            )}
           </div>
+
           {state.progress && (
-            <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
-              {isRunning && <Loader2 className="size-3 animate-spin text-primary" aria-hidden />}
+            <p className="mt-2 text-xs font-medium text-muted-foreground">
               {state.progress}
             </p>
           )}
 
+          {/* DUAL PARALLEL PROGRESS METERS */}
+          {isRunning && (state.totalWindows || (state.totalChunks && state.totalChunks > 0)) && (
+            <div className="mt-3 grid gap-2 sm:grid-cols-2">
+              {state.totalWindows ? (
+                <div className="rounded-lg border border-border/70 bg-card/50 p-2.5">
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="font-medium text-foreground">20-Min Movie Windows</span>
+                    <span className="font-mono text-muted-foreground">
+                      {state.completedWindows || 0} / {state.totalWindows} (
+                      {Math.round(((state.completedWindows || 0) / state.totalWindows) * 100)}%)
+                    </span>
+                  </div>
+                  <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                    <div
+                      className="h-full bg-blue-500 transition-all duration-300"
+                      style={{
+                        width: `${Math.min(100, Math.round(((state.completedWindows || 0) / state.totalWindows) * 100))}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+              ) : null}
+
+              {(state.totalChunks && state.totalChunks > 0) ? (
+                <div className="rounded-lg border border-border/70 bg-card/50 p-2.5">
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="font-medium text-foreground">1-Min Pipelined Chunks</span>
+                    <span className="font-mono text-muted-foreground">
+                      {state.completedChunks || 0} / {state.totalChunks} (
+                      {Math.round(((state.completedChunks || 0) / state.totalChunks) * 100)}%)
+                    </span>
+                  </div>
+                  <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                    <div
+                      className="h-full bg-amber-500 transition-all duration-300"
+                      style={{
+                        width: `${Math.min(100, Math.round(((state.completedChunks || 0) / state.totalChunks) * 100))}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          )}
+
           {/* WINDOW HITS */}
           {state.windowHits && state.windowHits.length > 0 && (
-            <div className="mt-2.5 border-t border-border/60 pt-2">
-              <span className="text-[11px] font-medium text-success">
-                <Sparkles className="mr-1 inline size-3" aria-hidden />
-                Window Hits Detected ({state.windowHits.length}):
-              </span>
-              <div className="mt-1 flex flex-wrap gap-1.5">
+            <div className="mt-3 border-t border-border/60 pt-2.5">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-semibold text-success">
+                  <Sparkles className="mr-1 inline size-3.5" aria-hidden />
+                  Instant Window Hits ({state.windowHits.length}):
+                </span>
+                <span className="text-[10px] text-muted-foreground">
+                  (Pipelined chunks scan automatically in background)
+                </span>
+              </div>
+              <div className="mt-1.5 flex flex-wrap gap-1.5">
                 {state.windowHits.map((hit, i) => (
                   <span
                     key={i}
-                    className="rounded-md border border-success/30 bg-success/10 px-2 py-0.5 font-mono text-[11px] text-success"
+                    className="inline-flex items-center gap-1.5 rounded-md border border-success/30 bg-success/10 px-2 py-1 font-mono text-[11px] text-success"
                   >
-                    Movie Min {hit.movieMinute} ({fmtTime(hit.shortStart)}–{fmtTime(hit.shortEnd)})
+                    <span>Movie Min {hit.movieMinute}</span>
+                    <span className="text-muted-foreground/80">({fmtTime(hit.shortStart)}–{fmtTime(hit.shortEnd)})</span>
                   </span>
                 ))}
               </div>

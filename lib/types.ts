@@ -233,6 +233,13 @@ export interface MissingSceneScanState {
   windowHits?: MissingSceneWindowHit[]
   candidates: MissingSceneCandidate[]
   addedMatches?: ChunkMatch[]
+  totalWindows?: number
+  completedWindows?: number
+  activeWindows?: number
+  totalChunks?: number
+  completedChunks?: number
+  activeChunks?: number
+  activeWorkers?: Array<{ type: 'window' | 'chunk'; label: string; model: string; keyIdx: number }>
   error?: string | null
   startedAt?: number | null
   finishedAt?: number | null

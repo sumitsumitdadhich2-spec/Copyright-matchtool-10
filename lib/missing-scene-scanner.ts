@@ -323,9 +323,18 @@ async function runMissingSceneScanner(
     const windowsToScan = allWindows.filter((w) => (selectedIndices ? selectedIndices.has(w.index) : true))
 
     state.status = 'scanning_windows'
-    state.progress = `Scanning ${windowsToScan.length} movie window(s) (20-min each) for missing scene(s)...`
+    state.totalWindows = windowsToScan.length
+    state.completedWindows = 0
+    state.activeWindows = 0
+    state.totalChunks = 0
+    state.completedChunks = 0
+    state.activeChunks = 0
+    state.progress = `Scanning ${windowsToScan.length} movie window(s) in parallel...`
     saveScan(scan)
-    addLog(scan, 'info', `[Missing Scene Finder] Starting 20-min window scan across ${windowsToScan.length} window(s)...`)
+    addLog(scan, 'info', `[Missing Scene Finder] 🚀 Starting parallel window scanner + instant pipelined chunk finder across ${windowsToScan.length} window(s)...`)
+
+    // Reuse existing chunks from this scan or other scans immediately
+    await findAndReuseMovieChunks(scanId, scan.movieName || '', scan.movieSize || 0, trimStart, trimEnd, scan.chunkCount || 0)
 
     // Build the window prompt
     const windowPrompt = `You are a forensic video analyst searching for SPECIFIC MISSING SCENE(S) from an edited short video in a movie window.
@@ -355,7 +364,9 @@ If NOT FOUND:
 PART <n>: NOT FOUND — not in this 20-minute window`
 
     const windowHits: MissingSceneWindowHit[] = []
-    const candidateMinutes = new Set<number>()
+    const processedMinutes = new Set<number>()
+    const chunkQueue: number[] = []
+    const candidates: MissingSceneCandidate[] = []
 
     // Build candidate lanes across all keys that have the active movie upload
     const windowCandLanes = keysWithMovie.flatMap((kw) =>
@@ -367,236 +378,6 @@ PART <n>: NOT FOUND — not in this 20-minute window`
       })),
     )
 
-    // Run window scan with retry handling
-    let completedWindows = 0
-    for (const win of windowsToScan) {
-      if (ctrl.stopping) break
-
-      const winStartAbs = trimStart + win.start
-      const winEndAbs = trimStart + win.end
-      const winLabel = `Window ${win.index + 1} (${fmtMinSec(winStartAbs)}–${fmtMinSec(winEndAbs)})`
-
-      state.progress = `Scanning ${winLabel} (${completedWindows + 1}/${windowsToScan.length})...`
-      saveScan(scan)
-
-      let windowSuccess = false
-      let winAttempt = 0
-      const maxWinAttempts = 6
-
-      while (!windowSuccess && winAttempt < maxWinAttempts) {
-        if (ctrl.stopping) break
-        winAttempt++
-
-        let releaseGlobalLock: ((sec?: number) => void) | null = null
-        try {
-          const { selected, release } = await globalGeminiCoordinator.acquireFirstAvailableLane({
-            scanId,
-            scanTitle: scan.shortName || scanId,
-            candidates: windowCandLanes,
-            operation: `Missing Scene ${winLabel}`,
-            videoSeconds: 60,
-            onWait: (msg) => addLog(scan, 'info', msg),
-            isStopping: () => ctrl.stopping,
-          })
-          releaseGlobalLock = release
-
-          const runnerAi = getClient(selected.apiKey)
-          const keyClip = await getClipForApiKey(selected.apiKey)
-          const kw = keysWithMovie.find((x) => apiKeyHash(x.apiKey) === apiKeyHash(selected.apiKey))
-          const movieUploadUri = kw ? kw.movieUri : keysWithMovie[0].movieUri
-
-          let text = ''
-          try {
-            const resp = await runnerAi.models.generateContent({
-              model: selected.modelId,
-              contents: [
-                {
-                  role: 'user',
-                  parts: [
-                    { fileData: { fileUri: keyClip.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 24 } },
-                    {
-                      fileData: { fileUri: movieUploadUri, mimeType: 'video/mp4' },
-                      videoMetadata: { fps: 1, startOffset: `${Math.round(win.start)}s`, endOffset: `${Math.round(win.end)}s` },
-                    },
-                    { text: windowPrompt },
-                  ],
-                },
-              ],
-            })
-            text = resp.text || ''
-            incrementModelUsage(selected.modelId, selected.apiKey)
-          } catch (reqErr) {
-            const re = classifyError(reqErr)
-            if (re.kind === 'rate') {
-              globalGeminiCoordinator.reportRateLimit(selected.apiKey, selected.modelId)
-              addLog(
-                scan,
-                'warn',
-                `[Missing Scene Finder] ${winLabel}: 429 Rate limit on Key ${selected.keyIdx} (${selected.modelId}) — retrying window on next available lane (attempt ${winAttempt}/${maxWinAttempts})...`,
-              )
-              continue
-            }
-            if (re.kind === 'rpd') {
-              globalGeminiCoordinator.reportExhausted(selected.apiKey, selected.modelId)
-              addLog(
-                scan,
-                'warn',
-                `[Missing Scene Finder] ${winLabel}: Daily quota exhausted on Key ${selected.keyIdx} (${selected.modelId}) — switching lane...`,
-              )
-              continue
-            }
-
-            const isPolicyBlocked =
-              re.kind === 'policy_blocked' ||
-              /prohibited_content|blocked_by_safety|safety_ratings_blocked|prompt block reason/i.test(re.message)
-
-            if (isPolicyBlocked) {
-              incrementModelUsage(selected.modelId, selected.apiKey)
-              addLog(
-                scan,
-                'warn',
-                `[Missing Scene Finder] ${winLabel}: Flagged by Google Policy (PROHIBITED_CONTENT) on ${selected.modelId} — triggering 1 sanitized retry with Audio Stripped (-an Mute) + Neutral prompt...`,
-              )
-              saveScan(scan)
-
-              // Sanitize muted clip video
-              const sanitizedDir = path.join(mediaDir, 'sanitized')
-              fs.mkdirSync(sanitizedDir, { recursive: true })
-              const sanitizedClipFile = path.join(sanitizedDir, 'missing-scenes-clip-muted.mp4')
-              if (!fs.existsSync(sanitizedClipFile)) {
-                await sanitizeVideoMute(clipOutFile, sanitizedClipFile)
-              }
-              const sanitizedUp = await uploadVideo(runnerAi, sanitizedClipFile)
-              uploadedFilesToClean.push({ key: selected.apiKey, name: sanitizedUp.name })
-
-              const sanitizedWindowPrompt = `Analyze visual scene alignment between Video 1 and Video 2 (silent forensic matching).
-For each PART in Video 1:
-If visual match occurs in Video 2, report:
-PART <number> MATCH: Movie Minute <N> (around <mm:ss> - <mm:ss>)
-If not found, report:
-PART <number>: NOT FOUND`
-
-              try {
-                const sanitizedResp = await runnerAi.models.generateContent({
-                  model: selected.modelId,
-                  contents: [
-                    {
-                      role: 'user',
-                      parts: [
-                        { fileData: { fileUri: sanitizedUp.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 24 } },
-                        {
-                          fileData: { fileUri: movieUploadUri, mimeType: 'video/mp4' },
-                          videoMetadata: { fps: 1, startOffset: `${Math.round(win.start)}s`, endOffset: `${Math.round(win.end)}s` },
-                        },
-                        { text: sanitizedWindowPrompt },
-                      ],
-                    },
-                  ],
-                })
-                text = sanitizedResp.text || ''
-                incrementModelUsage(selected.modelId, selected.apiKey)
-                addLog(scan, 'success', `[Missing Scene Finder] ${winLabel}: Sanitized retry succeeded after policy flag bypass`)
-              } catch (retryErr) {
-                const retryRe = classifyError(retryErr)
-                if (retryRe.kind === 'rate') {
-                  globalGeminiCoordinator.reportRateLimit(selected.apiKey, selected.modelId)
-                  continue
-                }
-                if (retryRe.kind === 'policy_blocked') {
-                  incrementModelUsage(selected.modelId, selected.apiKey)
-                }
-                throw retryErr
-              }
-            } else {
-              throw reqErr
-            }
-          }
-
-          windowSuccess = true
-          completedWindows++
-
-          // Parse matches
-          const lines = text.split('\n')
-          for (const line of lines) {
-            const matchRegex = /PART\s*(\d+).*?(?:MATCH|FOUND)/i
-            const partMatch = line.match(matchRegex)
-            if (partMatch) {
-              const partNum = parseInt(partMatch[1], 10)
-              const scenePart = sceneParts.find((p) => p.partNum === partNum) || sceneParts[0]
-
-              let foundMinute: number | null = null
-              const minRegex = /Movie Minute\s*:\s*(\d+)/i
-              const minM = line.match(minRegex)
-              if (minM) {
-                foundMinute = parseInt(minM[1], 10)
-              } else {
-                const timeRegex = /(\d{1,2}:\d{2}(?:\.\d+)?)\s*-\s*(\d{1,2}:\d{2}(?:\.\d+)?)/
-                const timeM = line.match(timeRegex)
-                if (timeM) {
-                  const parsedT = parseTs(timeM[1])
-                  if (parsedT !== null) {
-                    const absSec = parsedT < win.end ? winStartAbs + parsedT : parsedT
-                    foundMinute = Math.floor(absSec / 60)
-                  }
-                }
-              }
-
-              if (foundMinute !== null && foundMinute >= 0) {
-                candidateMinutes.add(foundMinute)
-                const hit: MissingSceneWindowHit = {
-                  windowIndex: win.index,
-                  windowStart: winStartAbs,
-                  windowEnd: winEndAbs,
-                  movieMinute: foundMinute,
-                  sceneId: scenePart.target.id,
-                  shortStart: scenePart.target.shortStart,
-                  shortEnd: scenePart.target.shortEnd,
-                  evidence: line.slice(0, 150),
-                  confidence: line.includes('HIGH') ? 'HIGH' : 'MEDIUM',
-                }
-                windowHits.push(hit)
-                state.windowHits = [...windowHits]
-                saveScan(scan)
-                addLog(
-                  scan,
-                  'success',
-                  `[Missing Scene Finder] ${winLabel}: Found scene ${fmtTime(scenePart.target.shortStart)}–${fmtTime(scenePart.target.shortEnd)} in Movie Minute ${foundMinute}!`,
-                )
-              }
-            }
-          }
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err)
-          if (winAttempt >= maxWinAttempts) {
-            addLog(scan, 'warn', `[Missing Scene Finder] ${winLabel} failed after ${maxWinAttempts} attempts: ${msg.slice(0, 120)}`)
-          }
-        } finally {
-          if (releaseGlobalLock) releaseGlobalLock(60)
-        }
-      }
-    }
-
-    if (ctrl.stopping) return
-
-    if (candidateMinutes.size === 0) {
-      state.status = 'done'
-      state.progress = 'Window scan complete — selected missing scene(s) were not found in movie windows.'
-      state.finishedAt = Date.now()
-      saveScan(scan)
-      addLog(scan, 'warn', '[Missing Scene Finder] None of the selected missing scenes were detected in the scanned windows.')
-      return
-    }
-
-    // 5. Chunk Scan for detected minutes (using all active API keys with zero 403 errors)
-    state.status = 'scanning_chunks'
-    state.progress = `Scanning 1-minute chunks for ${candidateMinutes.size} candidate minute(s)...`
-    saveScan(scan)
-    addLog(scan, 'info', `[Missing Scene Finder] Found ${candidateMinutes.size} candidate minute(s): [${Array.from(candidateMinutes).join(', ')}]. Slicing chunks and searching...`)
-
-    // Reuse existing chunks from this scan or other scans
-    await findAndReuseMovieChunks(scanId, scan.movieName || '', scan.movieSize || 0, trimStart, trimEnd, scan.chunkCount || 0)
-
-    const candidates: MissingSceneCandidate[] = []
     const activeKeys = apiKeys && apiKeys.length > 0 ? apiKeys : [primaryApiKey]
     const chunkCandLanes = activeKeys.flatMap((k: string, ki: number) =>
       CHUNK_MODEL_POOL.map((m) => ({
@@ -607,16 +388,90 @@ PART <number>: NOT FOUND`
       })),
     )
 
-    for (const minute of Array.from(candidateMinutes)) {
-      if (ctrl.stopping) break
+    let completedWindowsCount = 0
+    const windowQueue = [...windowsToScan]
+    let windowInFlight = 0
+    let chunkInFlight = 0
+    let isWindowPhaseDone = false
+
+    const MAX_PARALLEL_WINDOWS = Math.max(2, Math.min(windowCandLanes.length, 6))
+    const MAX_PARALLEL_CHUNKS = Math.max(3, Math.min(chunkCandLanes.length, 8))
+
+    function updateProgressSummary() {
+      const activeWinCount = windowInFlight
+      const activeChkCount = chunkInFlight
+      const winDone = completedWindowsCount
+      const winTotal = windowsToScan.length
+      const chkTotal = state.totalChunks || 0
+      const chkDone = state.completedChunks || 0
+
+      let progText = ''
+      if (activeWinCount > 0 && activeChkCount > 0) {
+        progText = `Parallel Scan: Windows (${winDone}/${winTotal} done, ${activeWinCount} active) · Chunks (${chkDone}/${chkTotal} done, ${activeChkCount} active)...`
+      } else if (activeWinCount > 0) {
+        progText = `Scanning ${winTotal} movie window(s) in parallel (${winDone}/${winTotal} done, ${activeWinCount} active)...`
+      } else if (activeChkCount > 0) {
+        progText = `Scanning 1-min chunks in parallel (${chkDone}/${chkTotal} done, ${activeChkCount} active)...`
+      } else if (isWindowPhaseDone && chunkQueue.length === 0 && activeChkCount === 0) {
+        progText = candidates.length > 0
+          ? `Scan finished! ${candidates.length} candidate match(es) found.`
+          : 'Scan complete — no matches found.'
+      }
+
+      state.progress = progText
+      state.completedWindows = winDone
+      state.activeWindows = activeWinCount
+      state.completedChunks = chkDone
+      state.activeChunks = activeChkCount
+      saveScan(scan)
+    }
+
+    // Trigger instant pipelined chunk scanning as soon as a window finds a minute
+    function triggerChunkScan(minute: number) {
+      if (processedMinutes.has(minute)) return
+      processedMinutes.add(minute)
+      chunkQueue.push(minute)
+      state.totalChunks = processedMinutes.size
+      updateProgressSummary()
+      void processChunkQueue()
+    }
+
+    // Chunk processor worker
+    async function processChunkQueue() {
+      while (chunkQueue.length > 0 && chunkInFlight < MAX_PARALLEL_CHUNKS && !ctrl.stopping) {
+        const minute = chunkQueue.shift()
+        if (minute === undefined) break
+
+        chunkInFlight++
+        updateProgressSummary()
+
+        void (async () => {
+          try {
+            await scanSingleChunk(minute)
+          } finally {
+            chunkInFlight--
+            state.completedChunks = (state.completedChunks || 0) + 1
+            updateProgressSummary()
+            void processChunkQueue()
+          }
+        })()
+      }
+    }
+
+    // Single Chunk Scanner (runs concurrently on free keys/models)
+    async function scanSingleChunk(minute: number) {
+      if (ctrl.stopping) return
 
       const chunkIdx = minute
       const chunkStart = chunkIdx * 60
       const chunkEnd = chunkStart + 60
       const chunkFile = chunkPath(chunksDir, chunkIdx)
 
-      state.progress = `Processing Chunk ${chunkIdx + 1} (${fmtMinSec(chunkStart)}–${fmtMinSec(chunkEnd)})...`
-      saveScan(scan)
+      addLog(
+        scan,
+        'info',
+        `[Missing Scene Finder] 🚀 Instant Chunk Scan: Minute ${minute} (Movie ${fmtMinSec(chunkStart)}–${fmtMinSec(chunkEnd)})...`,
+      )
 
       if (!fs.existsSync(/*turbopackIgnore: true*/ chunkFile)) {
         await extractClipPrecise(movieFile, chunkStart, chunkEnd, chunkFile)
@@ -626,10 +481,8 @@ PART <number>: NOT FOUND`
       let chunkAttempt = 0
       const maxChunkAttempts = 5
 
-      while (!chunkSuccess && chunkAttempt < maxChunkAttempts) {
-        if (ctrl.stopping) break
+      while (!chunkSuccess && chunkAttempt < maxChunkAttempts && !ctrl.stopping) {
         chunkAttempt++
-
         let releaseChunkLock: ((sec?: number) => void) | null = null
         try {
           const { selected, release } = await globalGeminiCoordinator.acquireFirstAvailableLane({
@@ -716,7 +569,6 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
                 'warn',
                 `[Missing Scene Finder] Chunk ${chunkIdx + 1}: Flagged by Google Policy (PROHIBITED_CONTENT) on ${selected.modelId} — triggering 1 sanitized retry with Audio Stripped (-an Mute) + Neutral prompt...`,
               )
-              saveScan(scan)
 
               // Sanitize muted chunk video
               const sanitizedDir = path.join(mediaDir, 'sanitized')
@@ -770,7 +622,6 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
             const m2 = parseTs(match[4])
 
             if (s1 !== null && s2 !== null && m1 !== null && m2 !== null) {
-              // Find which target scene this corresponds to
               let matchedTarget = targets[0]
               for (const sp of sceneParts) {
                 if (s1 >= sp.clipStart - 1 && s1 <= sp.clipEnd + 1) {
@@ -802,7 +653,7 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
               addLog(
                 scan,
                 'info',
-                `[Missing Scene Finder] Chunk ${chunkIdx + 1} match candidate: Short ${fmtTime(cand.shortStart)}–${fmtTime(cand.shortEnd)} --> Movie ${fmtTime(cand.movieStart)}–${fmtTime(cand.movieEnd)}`,
+                `[Missing Scene Finder] 🎯 Candidate match found: Short ${fmtTime(cand.shortStart)}–${fmtTime(cand.shortEnd)} --> Movie ${fmtTime(cand.movieStart)}–${fmtTime(cand.movieEnd)} (Minute ${minute})`,
               )
             }
           }
@@ -817,12 +668,251 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
       }
     }
 
+    // Single Window Scanner
+    async function scanSingleWindow(win: { index: number; start: number; end: number }) {
+      const winStartAbs = trimStart + win.start
+      const winEndAbs = trimStart + win.end
+      const winLabel = `Window ${win.index + 1} (${fmtMinSec(winStartAbs)}–${fmtMinSec(winEndAbs)})`
+
+      let windowSuccess = false
+      let winAttempt = 0
+      const maxWinAttempts = 6
+
+      while (!windowSuccess && winAttempt < maxWinAttempts && !ctrl.stopping) {
+        winAttempt++
+        let releaseGlobalLock: ((sec?: number) => void) | null = null
+        try {
+          const { selected, release } = await globalGeminiCoordinator.acquireFirstAvailableLane({
+            scanId,
+            scanTitle: scan.shortName || scanId,
+            candidates: windowCandLanes,
+            operation: `Missing Scene ${winLabel}`,
+            videoSeconds: 60,
+            onWait: (msg) => addLog(scan, 'info', msg),
+            isStopping: () => ctrl.stopping,
+          })
+          releaseGlobalLock = release
+
+          const runnerAi = getClient(selected.apiKey)
+          const keyClip = await getClipForApiKey(selected.apiKey)
+          const kw = keysWithMovie.find((x) => apiKeyHash(x.apiKey) === apiKeyHash(selected.apiKey))
+          const movieUploadUri = kw ? kw.movieUri : keysWithMovie[0].movieUri
+
+          addLog(
+            scan,
+            'info',
+            `[Missing Scene Finder] ${winLabel}: Scanning on Key ${selected.keyIdx} (${selected.modelId})...`,
+          )
+
+          let text = ''
+          try {
+            const resp = await runnerAi.models.generateContent({
+              model: selected.modelId,
+              contents: [
+                {
+                  role: 'user',
+                  parts: [
+                    { fileData: { fileUri: keyClip.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 24 } },
+                    {
+                      fileData: { fileUri: movieUploadUri, mimeType: 'video/mp4' },
+                      videoMetadata: { fps: 1, startOffset: `${Math.round(win.start)}s`, endOffset: `${Math.round(win.end)}s` },
+                    },
+                    { text: windowPrompt },
+                  ],
+                },
+              ],
+            })
+            text = resp.text || ''
+            incrementModelUsage(selected.modelId, selected.apiKey)
+          } catch (reqErr) {
+            const re = classifyError(reqErr)
+            if (re.kind === 'rate') {
+              globalGeminiCoordinator.reportRateLimit(selected.apiKey, selected.modelId)
+              addLog(
+                scan,
+                'warn',
+                `[Missing Scene Finder] ${winLabel}: 429 Rate limit on Key ${selected.keyIdx} (${selected.modelId}) — retrying window on next available lane (attempt ${winAttempt}/${maxWinAttempts})...`,
+              )
+              continue
+            }
+            if (re.kind === 'rpd') {
+              globalGeminiCoordinator.reportExhausted(selected.apiKey, selected.modelId)
+              addLog(
+                scan,
+                'warn',
+                `[Missing Scene Finder] ${winLabel}: Daily quota exhausted on Key ${selected.keyIdx} (${selected.modelId}) — switching lane...`,
+              )
+              continue
+            }
+
+            const isPolicyBlocked =
+              re.kind === 'policy_blocked' ||
+              /prohibited_content|blocked_by_safety|safety_ratings_blocked|prompt block reason/i.test(re.message)
+
+            if (isPolicyBlocked) {
+              incrementModelUsage(selected.modelId, selected.apiKey)
+              addLog(
+                scan,
+                'warn',
+                `[Missing Scene Finder] ${winLabel}: Flagged by Google Policy (PROHIBITED_CONTENT) on ${selected.modelId} — triggering 1 sanitized retry with Audio Stripped (-an Mute) + Neutral prompt...`,
+              )
+
+              // Sanitize muted clip video
+              const sanitizedDir = path.join(mediaDir, 'sanitized')
+              fs.mkdirSync(sanitizedDir, { recursive: true })
+              const sanitizedClipFile = path.join(sanitizedDir, 'missing-scenes-clip-muted.mp4')
+              if (!fs.existsSync(sanitizedClipFile)) {
+                await sanitizeVideoMute(clipOutFile, sanitizedClipFile)
+              }
+              const sanitizedUp = await uploadVideo(runnerAi, sanitizedClipFile)
+              uploadedFilesToClean.push({ key: selected.apiKey, name: sanitizedUp.name })
+
+              const sanitizedWindowPrompt = `Analyze visual scene alignment between Video 1 and Video 2 (silent forensic matching).
+For each PART in Video 1:
+If visual match occurs in Video 2, report:
+PART <number> MATCH: Movie Minute <N> (around <mm:ss> - <mm:ss>)
+If not found, report:
+PART <number>: NOT FOUND`
+
+              try {
+                const sanitizedResp = await runnerAi.models.generateContent({
+                  model: selected.modelId,
+                  contents: [
+                    {
+                      role: 'user',
+                      parts: [
+                        { fileData: { fileUri: sanitizedUp.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 24 } },
+                        {
+                          fileData: { fileUri: movieUploadUri, mimeType: 'video/mp4' },
+                          videoMetadata: { fps: 1, startOffset: `${Math.round(win.start)}s`, endOffset: `${Math.round(win.end)}s` },
+                        },
+                        { text: sanitizedWindowPrompt },
+                      ],
+                    },
+                  ],
+                })
+                text = sanitizedResp.text || ''
+                incrementModelUsage(selected.modelId, selected.apiKey)
+                addLog(scan, 'success', `[Missing Scene Finder] ${winLabel}: Sanitized retry succeeded after policy flag bypass`)
+              } catch (retryErr) {
+                const retryRe = classifyError(retryErr)
+                if (retryRe.kind === 'rate') {
+                  globalGeminiCoordinator.reportRateLimit(selected.apiKey, selected.modelId)
+                  continue
+                }
+                if (retryRe.kind === 'policy_blocked') {
+                  incrementModelUsage(selected.modelId, selected.apiKey)
+                }
+                throw retryErr
+              }
+            } else {
+              throw reqErr
+            }
+          }
+
+          windowSuccess = true
+          completedWindowsCount++
+          updateProgressSummary()
+
+          // Parse matches and IMMEDIATELY pipeline chunk scans!
+          const lines = text.split('\n')
+          for (const line of lines) {
+            const matchRegex = /PART\s*(\d+).*?(?:MATCH|FOUND)/i
+            const partMatch = line.match(matchRegex)
+            if (partMatch) {
+              const partNum = parseInt(partMatch[1], 10)
+              const scenePart = sceneParts.find((p) => p.partNum === partNum) || sceneParts[0]
+
+              let foundMinute: number | null = null
+              const minRegex = /Movie Minute\s*:\s*(\d+)/i
+              const minM = line.match(minRegex)
+              if (minM) {
+                foundMinute = parseInt(minM[1], 10)
+              } else {
+                const timeRegex = /(\d{1,2}:\d{2}(?:\.\d+)?)\s*-\s*(\d{1,2}:\d{2}(?:\.\d+)?)/
+                const timeM = line.match(timeRegex)
+                if (timeM) {
+                  const parsedT = parseTs(timeM[1])
+                  if (parsedT !== null) {
+                    const absSec = parsedT < win.end ? winStartAbs + parsedT : parsedT
+                    foundMinute = Math.floor(absSec / 60)
+                  }
+                }
+              }
+
+              if (foundMinute !== null && foundMinute >= 0) {
+                const hit: MissingSceneWindowHit = {
+                  windowIndex: win.index,
+                  windowStart: winStartAbs,
+                  windowEnd: winEndAbs,
+                  movieMinute: foundMinute,
+                  sceneId: scenePart.target.id,
+                  shortStart: scenePart.target.shortStart,
+                  shortEnd: scenePart.target.shortEnd,
+                  evidence: line.slice(0, 150),
+                  confidence: line.includes('HIGH') ? 'HIGH' : 'MEDIUM',
+                }
+                windowHits.push(hit)
+                state.windowHits = [...windowHits]
+                saveScan(scan)
+                addLog(
+                  scan,
+                  'success',
+                  `[Missing Scene Finder] ⚡ Instant Hit: ${winLabel} found scene ${fmtTime(scenePart.target.shortStart)}–${fmtTime(scenePart.target.shortEnd)} in Movie Min ${foundMinute}! Triggering immediate 24fps chunk scan...`,
+                )
+                // IMMEDIATELY trigger streaming chunk scan in parallel!
+                triggerChunkScan(foundMinute)
+              }
+            }
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          if (winAttempt >= maxWinAttempts) {
+            addLog(scan, 'warn', `[Missing Scene Finder] ${winLabel} failed after ${maxWinAttempts} attempts: ${msg.slice(0, 120)}`)
+          }
+        } finally {
+          if (releaseGlobalLock) releaseGlobalLock(60)
+        }
+      }
+    }
+
+    // Launch parallel window scanning workers
+    const windowWorkers: Promise<void>[] = []
+    for (let w = 0; w < MAX_PARALLEL_WINDOWS; w++) {
+      windowWorkers.push(
+        (async () => {
+          while (windowQueue.length > 0 && !ctrl.stopping) {
+            const win = windowQueue.shift()
+            if (!win) break
+            windowInFlight++
+            updateProgressSummary()
+            try {
+              await scanSingleWindow(win)
+            } finally {
+              windowInFlight--
+              updateProgressSummary()
+            }
+          }
+        })(),
+      )
+    }
+
+    await Promise.all(windowWorkers)
+    isWindowPhaseDone = true
+
+    // Wait until all pipelined chunks are finished processing
+    while ((chunkQueue.length > 0 || chunkInFlight > 0) && !ctrl.stopping) {
+      await new Promise((r) => setTimeout(r, 400))
+    }
+
     if (ctrl.stopping) return
 
-    // 6. Finish scan - manual user review
+    // 5. Finish scan - manual user review
     state.status = 'done'
     state.progress = candidates.length > 0
       ? `Scan finished! ${candidates.length} candidate match(es) found — review and accept/reject below.`
+      : windowHits.length > 0
+      ? `Window scan found ${windowHits.length} potential hit(s), but exact frame alignment was not confirmed.`
       : `Scan finished! No matching scenes found in the selected windows.`
     state.finishedAt = Date.now()
     saveScan(scan)
