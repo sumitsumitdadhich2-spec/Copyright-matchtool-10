@@ -33,7 +33,7 @@ export const VERIFY_MODEL_POOL: ModelSpec[] = [
  * output tokens apply globally to every request (see GEN_CONFIG). */
 export const RESCAN_MODEL_POOL: ModelSpec[] = [
   { id: 'gemini-3-flash-preview', rpm: 5, rpd: 20 },
-  { id: 'gemini-3.5-flash', rpm: 5, rpd: 20 },
+  { id: 'gemini-3.5-flash', rpm: 5, rpd: 500 },
 ]
 
 /** RESCAN BACKUP models: jab primary rescan models (3-flash-preview / 3.5-flash)
@@ -57,7 +57,7 @@ export const GAP_FINDER_AVAILABLE_MODELS: GapFinderModelOption[] = [
   { id: 'gemini-3.7-flash', name: '3.7-shiva', rpd: 20, rpm: 5, description: 'Fast, balanced high-accuracy forensic', recommended: true },
   { id: 'gemini-3.8-flash', name: '3.8-shiva', rpd: 20, rpm: 5, description: 'Deep forensic multi-frame analysis', recommended: true },
   { id: 'gemini-3.6-flash', name: '3.6-shiva', rpd: 20, rpm: 5, description: 'Robust baseline scene comparison', recommended: true },
-  { id: 'gemini-3.5-flash', name: '3.5-shiva', rpd: 20, rpm: 5, description: 'Precision chunk matcher', recommended: false },
+  { id: 'gemini-3.5-flash', name: '3.5-shiva', rpd: 500, rpm: 5, description: 'Precision chunk matcher', recommended: false },
   { id: 'gemini-3.5-flash-lite', name: '3.5-shiva-lite', rpd: 500, rpm: 15, description: 'High daily quota (500 RPD)', recommended: false },
   { id: 'gemini-3.1-flash-lite', name: '3.1-shiva-lite', rpd: 500, rpm: 15, description: 'High daily quota (500 RPD)', recommended: false },
 ]
@@ -117,6 +117,14 @@ export const MODEL_MIN_INTERVAL_MS = 60_000
 /** Cooldown applied on RPM/TPM-type 429s (ms). */
 export const RATE_COOLDOWN_MS = 60_000
 
+/**
+ * Mandatory cooldown per chunk request: 1 minute 10 seconds (70,000 ms).
+ * After 1 request completes, this cooldown is recorded and enforced on that (key × model) lane.
+ * During this 70s window, the system prepares and uploads the next movie chunk and short clip,
+ * and sends the next request only after the 70s cooldown is 100% complete.
+ */
+export const CHUNK_COOLDOWN_MS = 70_000
+
 /** fps used for every chunk-map request (locked).
  * Short + 60s chunk together @ 24 fps × 65 tok/frame ≈ ~190K tokens — fits under the 250K TPM cap at default resolution. */
 export const SCAN_FPS = 24
@@ -134,10 +142,13 @@ export function estimateRequestTokens(totalVideoSeconds: number): number {
   return Math.ceil(totalVideoSeconds * SCAN_FPS * TOKENS_PER_FRAME) + 2_000
 }
 
-/** Minimum spacing (ms) between requests of this size on one (key × model) lane
- * so the model runs at FULL TPM capacity — small verify clips wait seconds,
- * full chunk-map requests wait the whole minute. */
+/** Minimum spacing (ms) between requests of this size on one (key × model) lane.
+ * For chunk-mapping requests (>= 50s total video), strictly enforces the 1m 10s (70s) cooldown.
+ * For small verify clips, scales down proportionally so verification doesn't wait unnecessarily. */
 export function pacingIntervalMs(totalVideoSeconds: number): number {
+  if (totalVideoSeconds >= 50) {
+    return CHUNK_COOLDOWN_MS
+  }
   const tokens = estimateRequestTokens(totalVideoSeconds)
   const ms = Math.ceil((tokens / TPM_LIMIT) * 60_000)
   return Math.min(MODEL_MIN_INTERVAL_MS, Math.max(3_000, ms))

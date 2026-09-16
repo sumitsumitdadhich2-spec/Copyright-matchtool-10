@@ -296,6 +296,7 @@ export async function verifySingleMinute(
         const rawText = extractResponseText(response)
         verifiedParts = parseBatchVerifierResponse(rawText, plan.parts)
         incrementModelUsage(chosenModel, lane.apiKey)
+        globalGeminiCoordinator.recordSuccess(lane.apiKey, chosenModel, 0)
         break // Success!
       } catch (err) {
         const geminiErr = classifyError(err)
@@ -305,18 +306,19 @@ export async function verifySingleMinute(
           `[Batch Verifier] Min ${minuteIndex + 1} attempt ${attempts} failed on ${chosenModel || 'model'}: ${geminiErr.message}`,
         )
 
-        if (geminiErr.kind === 'rpd' && chosenLane) {
-          globalGeminiCoordinator.reportExhausted(chosenLane.apiKey, chosenLane.modelId, 0, chosenLane.rpd || 20)
+        if ((geminiErr.kind === 'rpd' || geminiErr.kind === 'rate') && chosenLane) {
+          const outcome = globalGeminiCoordinator.handleQuotaOrRateError(
+            chosenLane.apiKey,
+            chosenLane.modelId,
+            0,
+            chosenLane.rpd || 20,
+            geminiErr.kind === 'rpd',
+          )
           logScan(
             scanId,
             'warn',
-            `[Batch Verifier] Key ${chosenLane.keyIdx} (${chosenModel}) daily quota exhausted (RPD). Model retired, switching to remaining active keys/models immediately.`,
+            `[Batch Verifier] Key ${chosenLane.keyIdx} (${chosenModel}): ${outcome.reason}`,
           )
-          continue
-        }
-
-        if (geminiErr.kind === 'rate' && chosenLane) {
-          globalGeminiCoordinator.reportRateLimit(chosenLane.apiKey, chosenLane.modelId)
           continue
         }
 

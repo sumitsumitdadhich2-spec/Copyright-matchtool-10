@@ -539,23 +539,21 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
             })
             cText = resp.text || ''
             incrementModelUsage(selected.modelId, selected.apiKey)
+            globalGeminiCoordinator.recordSuccess(selected.apiKey, selected.modelId, 0)
           } catch (reqErr) {
             const re = classifyError(reqErr)
-            if (re.kind === 'rate') {
-              globalGeminiCoordinator.reportRateLimit(selected.apiKey, selected.modelId)
-              addLog(
-                scan,
-                'warn',
-                `[Missing Scene Finder] Chunk ${chunkIdx + 1}: 429 Rate limit on Key ${selected.keyIdx} (${selected.modelId}) — retrying chunk on next available lane (attempt ${chunkAttempt}/${maxChunkAttempts})...`,
+            if (re.kind === 'rate' || re.kind === 'rpd') {
+              const outcome = globalGeminiCoordinator.handleQuotaOrRateError(
+                selected.apiKey,
+                selected.modelId,
+                0,
+                selected.rpd || 20,
+                re.kind === 'rpd',
               )
-              continue
-            }
-            if (re.kind === 'rpd') {
-              globalGeminiCoordinator.reportExhausted(selected.apiKey, selected.modelId, 0, selected.rpd || 20)
               addLog(
                 scan,
                 'warn',
-                `[Missing Scene Finder] Chunk ${chunkIdx + 1}: Daily quota exhausted on Key ${selected.keyIdx} (${selected.modelId}) — persisted, switching to remaining models on Key ${selected.keyIdx} or next key...`,
+                `[Missing Scene Finder] Chunk ${chunkIdx + 1}: ${outcome.reason} (attempt ${chunkAttempt}/${maxChunkAttempts})`,
               )
               continue
             }
@@ -724,23 +722,21 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
             })
             text = resp.text || ''
             incrementModelUsage(selected.modelId, selected.apiKey)
+            globalGeminiCoordinator.recordSuccess(selected.apiKey, selected.modelId, 0)
           } catch (reqErr) {
             const re = classifyError(reqErr)
-            if (re.kind === 'rate') {
-              globalGeminiCoordinator.reportRateLimit(selected.apiKey, selected.modelId)
-              addLog(
-                scan,
-                'warn',
-                `[Missing Scene Finder] ${winLabel}: 429 Rate limit on Key ${selected.keyIdx} (${selected.modelId}) — retrying window on next available lane (attempt ${winAttempt}/${maxWinAttempts})...`,
+            if (re.kind === 'rate' || re.kind === 'rpd') {
+              const outcome = globalGeminiCoordinator.handleQuotaOrRateError(
+                selected.apiKey,
+                selected.modelId,
+                0,
+                selected.rpd || 20,
+                re.kind === 'rpd',
               )
-              continue
-            }
-            if (re.kind === 'rpd') {
-              globalGeminiCoordinator.reportExhausted(selected.apiKey, selected.modelId, 0, selected.rpd || 20)
               addLog(
                 scan,
                 'warn',
-                `[Missing Scene Finder] ${winLabel}: Daily quota exhausted on Key ${selected.keyIdx} (${selected.modelId}) — persisted, switching to remaining models on Key ${selected.keyIdx} or next key...`,
+                `[Missing Scene Finder] ${winLabel}: ${outcome.reason} (attempt ${winAttempt}/${maxWinAttempts})`,
               )
               continue
             }

@@ -12,6 +12,7 @@ import {
   MAX_QUALITY_RETRIES,
   MODEL_MIN_INTERVAL_MS,
   RATE_COOLDOWN_MS,
+  CHUNK_COOLDOWN_MS,
   CHUNK_SECONDS,
   pacingIntervalMs,
   type ModelSpec,
@@ -1750,6 +1751,7 @@ class Scheduler {
         slot,
         operation: `Verify/Rescan on ${m.id}`,
         videoSeconds,
+        rpd: m.rpd || 500,
         onWait: (msg) => {
           st.state = 'waiting'
           addLog(job.scan, 'info', msg)
@@ -1772,14 +1774,26 @@ class Scheduler {
       try {
         const rawRes = await fn()
         st.usedToday = incrementModelUsage(m.id, lane.apiKey)
+        globalGeminiCoordinator.recordSuccess(lane.apiKey, m.id, slot)
         this.mark(job)
         return rawRes
       } catch (err) {
         const e = err instanceof GeminiError ? err : classifyError(err)
-        if (e.kind === 'rate') {
-          globalGeminiCoordinator.reportRateLimit(lane.apiKey, m.id, RATE_COOLDOWN_MS, slot)
-        } else if (e.kind === 'rpd') {
-          globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, slot, m.rpd)
+        if (e.kind === 'rate' || e.kind === 'rpd') {
+          const outcome = globalGeminiCoordinator.handleQuotaOrRateError(
+            lane.apiKey,
+            m.id,
+            slot,
+            m.rpd || 20,
+            e.kind === 'rpd',
+          )
+          if (outcome.action === 'exhausted') {
+            setModelExhausted(m.id, lane.apiKey, m.rpd || 20)
+            st.state = 'exhausted'
+          } else {
+            job.cooldownUntil[pk] = Date.now() + CHUNK_COOLDOWN_MS
+            st.state = 'cooling'
+          }
         }
         throw err
       }
@@ -2334,6 +2348,7 @@ class Scheduler {
           slot: 0,
           operation: `Chunk ${chunkIndex} map`,
           videoSeconds: 60,
+          rpd: m.rpd || 500,
           onWait: (msg) => {
             st.state = 'waiting'
             addLog(scan, 'info', msg)
@@ -2414,8 +2429,10 @@ class Scheduler {
         try {
           // Request Attempt 1: Call Gemini
           raw = await mapChunkRequest(lane.ai, m.id, effectiveShortUri, effectiveUploadedUri, effectivePrompt)
+          job.nextFreeAt[rk] = Date.now() + CHUNK_COOLDOWN_MS
           const used = incrementModelUsage(m.id, lane.apiKey)
           st.usedToday = used
+          globalGeminiCoordinator.recordSuccess(lane.apiKey, m.id, 0)
           chunk.requestCount = (chunk.requestCount || 0) + 1
           this.mark(job)
         } catch (reqErr) {
@@ -2471,6 +2488,7 @@ class Scheduler {
             // Request Attempt 2: Sanitized Retry with neutral prompt
             try {
               raw = await mapChunkRequest(lane.ai, m.id, sanitizedShortUri, sanitizedUploaded.uri, CHUNK_MAP_SANITIZED_PROMPT)
+              job.nextFreeAt[rk] = Date.now() + CHUNK_COOLDOWN_MS
               const usedRetry = incrementModelUsage(m.id, lane.apiKey)
               st.usedToday = usedRetry
               chunk.requestCount = (chunk.requestCount || 0) + 1
@@ -2495,6 +2513,7 @@ class Scheduler {
             await sleep(2000)
             try {
               raw = await mapChunkRequest(lane.ai, m.id, shortUri, uploaded.uri)
+              job.nextFreeAt[rk] = Date.now() + CHUNK_COOLDOWN_MS
               const usedRetry = incrementModelUsage(m.id, lane.apiKey)
               st.usedToday = usedRetry
               chunk.requestCount = (chunk.requestCount || 0) + 1
@@ -2608,23 +2627,33 @@ class Scheduler {
           chunk.status = 'pending'
           job.queue.push(chunkIndex)
           addLog(scan, 'error', `API Key ${lane.idx} is invalid/expired — disabled for this scan; Chunk ${chunkIndex} re-queued for another key`)
-        } else if (e.kind === 'rpd') {
-          globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, 0, m.rpd)
-          setModelExhausted(m.id, lane.apiKey, m.rpd)
-          const laneState = job.scan.keyLanes.find((l) => l.idx === lane.idx)
-          if (laneState) {
-            const ms = laneState.models.find((item) => item.id === m.id)
-            if (ms) ms.state = 'exhausted'
+        } else if (e.kind === 'rpd' || e.kind === 'rate') {
+          const quotaOutcome = globalGeminiCoordinator.handleQuotaOrRateError(
+            lane.apiKey,
+            m.id,
+            0,
+            m.rpd || 20,
+            e.kind === 'rpd',
+          )
+          if (quotaOutcome.action === 'exhausted') {
+            setModelExhausted(m.id, lane.apiKey, m.rpd || 20)
+            const laneState = job.scan.keyLanes.find((l) => l.idx === lane.idx)
+            if (laneState) {
+              const ms = laneState.models.find((item) => item.id === m.id)
+              if (ms) ms.state = 'exhausted'
+            }
+            addLog(scan, 'warn', `${m.id} (key ${lane.idx}): ${quotaOutcome.reason}. Model set aside today; remaining models on key ${lane.idx} continue. Chunk ${chunkIndex} re-queued.`)
+          } else {
+            job.cooldownUntil[this.rateKey(lane, m)] = Date.now() + CHUNK_COOLDOWN_MS
+            const laneState = job.scan.keyLanes.find((l) => l.idx === lane.idx)
+            if (laneState) {
+              const ms = laneState.models.find((item) => item.id === m.id)
+              if (ms) ms.state = 'cooling'
+            }
+            addLog(scan, 'warn', `${m.id} (key ${lane.idx}): ${quotaOutcome.reason}. Chunk ${chunkIndex} re-queued.`)
           }
           chunk.status = 'pending'
           job.queue.push(chunkIndex)
-          addLog(scan, 'warn', `${m.id} (key ${lane.idx}) model daily quota exhausted (${m.rpd}/${m.rpd} RPD) — Chunk ${chunkIndex} re-queued for another worker`)
-        } else if (e.kind === 'rate') {
-          globalGeminiCoordinator.reportRateLimit(lane.apiKey, m.id, RATE_COOLDOWN_MS, 0)
-          job.cooldownUntil[this.rateKey(lane, m)] = Date.now() + RATE_COOLDOWN_MS
-          chunk.status = 'pending'
-          job.queue.push(chunkIndex)
-          addLog(scan, 'warn', `Rate limit on ${m.id} (key ${lane.idx}) — Chunk ${chunkIndex} safely re-queued for another worker/key`)
         } else if (e.kind === 'empty') {
           chunk.status = 'pending'
           job.queue.push(chunkIndex)
@@ -2636,7 +2665,7 @@ class Scheduler {
         }
         this.mark(job)
       } finally {
-        if (releaseGlobalLock) releaseGlobalLock(60)
+        if (releaseGlobalLock) releaseGlobalLock(60, CHUNK_COOLDOWN_MS)
         // The short video is reused across chunks; the chunk upload is one-shot.
         if (chunkFileName) void deleteFileQuiet(lane.ai, chunkFileName)
         // Backup uploads: used copies — sab delete.

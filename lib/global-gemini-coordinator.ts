@@ -8,7 +8,7 @@ import {
   geminiUsageDay,
   checkDailyReset,
 } from './store'
-import { pacingIntervalMs, RATE_COOLDOWN_MS } from './models'
+import { pacingIntervalMs, RATE_COOLDOWN_MS, CHUNK_COOLDOWN_MS } from './models'
 
 export interface CandidateLane {
   apiKey: string
@@ -22,7 +22,7 @@ interface LaneWaiter {
   scanId: string
   scanTitle: string
   operation: string
-  resolve: (releaseFn: (actualVideoSec?: number) => void) => void
+  resolve: (releaseFn: (actualVideoSec?: number, cooldownOverrideMs?: number) => void) => void
   reject: (err: Error) => void
   isStopping?: () => boolean
 }
@@ -37,10 +37,12 @@ interface GlobalLaneState {
   activeScanTitle: string | null
   activeOperation: string | null
   activeSince: number | null
+  lastCompletedAt?: number | null
   lastOperation: string | null
   lastOperationVideoSec: number | null
   nextFreeAt: number
   cooldownUntil: number
+  consecutiveQuotaErrors?: number
   isExhausted: boolean
   waiters: LaneWaiter[]
 }
@@ -73,7 +75,7 @@ class GlobalGeminiCoordinator {
    * Verifies if a model on a given API key has exhausted its daily quota (RPD)
    * using coordinator in-memory lane state and cached counters.json.
    */
-  public isModelExhausted(apiKey: string, modelId: string, rpdCap: number = 20): boolean {
+  public isModelExhausted(apiKey: string, modelId: string, rpdCap: number = 500): boolean {
     this.checkDayRollover()
     const lane = this.getOrCreateLane(apiKey, modelId, 0)
     const exhaustedInStore = isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)
@@ -103,6 +105,7 @@ class GlobalGeminiCoordinator {
         activeScanTitle: null,
         activeOperation: null,
         activeSince: null,
+        lastCompletedAt: null,
         lastOperation: null,
         lastOperationVideoSec: null,
         nextFreeAt: 0,
@@ -117,7 +120,7 @@ class GlobalGeminiCoordinator {
   }
 
   /** Check if a lane is currently in use by ANY scan, in cooldown/pacing, or exhausted */
-  public isLaneBusy(apiKey: string, modelId: string, slot: number = 0, rpdCap: number = 20): {
+  public isLaneBusy(apiKey: string, modelId: string, slot: number = 0, rpdCap: number = 500): {
     busy: boolean
     exhausted?: boolean
     activeScanId?: string
@@ -220,7 +223,7 @@ class GlobalGeminiCoordinator {
       slot = 0,
       operation,
       videoSeconds = 60,
-      rpd = 20,
+      rpd = 500,
       onWait,
       isStopping,
     } = opts
@@ -333,8 +336,8 @@ class GlobalGeminiCoordinator {
         lane.activeOperation = operation
         lane.activeSince = Date.now()
 
-        const releaseFn = (actualVideoSec?: number) => {
-          this.releaseLane(lane, actualVideoSec ?? videoSeconds)
+        const releaseFn = (actualVideoSec?: number, cooldownOverrideMs?: number) => {
+          this.releaseLane(lane, actualVideoSec ?? videoSeconds, cooldownOverrideMs)
         }
 
         resolve(releaseFn)
@@ -391,7 +394,7 @@ class GlobalGeminiCoordinator {
 
       // 1. Filter out permanently exhausted / disabled lanes and persist exhausted state instantly
       const availableCandidates = candidates.filter((c) => {
-        return !this.isModelExhausted(c.apiKey, c.modelId, c.rpd || 20)
+        return !this.isModelExhausted(c.apiKey, c.modelId, c.rpd || 500)
       })
 
       if (availableCandidates.length === 0) {
@@ -462,12 +465,14 @@ class GlobalGeminiCoordinator {
     }
   }
 
-  private releaseLane(lane: GlobalLaneState, videoSeconds: number) {
-    const paceMs = pacingIntervalMs(videoSeconds)
-    // Pace from when the request became active (sliding TPM window) rather than blindly adding full paceMs after completion
-    const elapsedSinceActive = lane.activeSince ? Math.max(0, Date.now() - lane.activeSince) : 0
-    const remainingPaceMs = Math.max(0, paceMs - elapsedSinceActive)
-    lane.nextFreeAt = Date.now() + remainingPaceMs
+  private releaseLane(lane: GlobalLaneState, videoSeconds: number, cooldownOverrideMs?: number) {
+    const paceMs = cooldownOverrideMs !== undefined
+      ? cooldownOverrideMs
+      : (videoSeconds >= 50 ? CHUNK_COOLDOWN_MS : pacingIntervalMs(videoSeconds))
+    const now = Date.now()
+    lane.lastCompletedAt = now
+    lane.nextFreeAt = now + paceMs
+    lane.cooldownUntil = Math.max(lane.cooldownUntil, now + paceMs)
     lane.lastOperation = lane.activeOperation
     lane.lastOperationVideoSec = videoSeconds
     lane.activeScanId = null
@@ -479,7 +484,7 @@ class GlobalGeminiCoordinator {
     if (lane.waiters.length > 0) {
       setTimeout(() => {
         void this.processNext(lane)
-      }, remainingPaceMs + 20)
+      }, paceMs + 20)
     }
   }
 
@@ -531,6 +536,12 @@ class GlobalGeminiCoordinator {
     }
   }
 
+  /** Record successful request on this lane — resets consecutive error counters */
+  public recordSuccess(apiKey: string, modelId: string, slot: number = 0) {
+    const lane = this.getOrCreateLane(apiKey, modelId, slot)
+    lane.consecutiveQuotaErrors = 0
+  }
+
   /** Report a 429 Rate Limit error on a lane across the entire app */
   public reportRateLimit(apiKey: string, modelId: string, cooldownMs: number = RATE_COOLDOWN_MS, slot: number = 0) {
     const kh = apiKeyHash(apiKey)
@@ -544,6 +555,71 @@ class GlobalGeminiCoordinator {
       if (other.keyHash === kh && other.modelId === modelId) {
         other.cooldownUntil = Math.max(other.cooldownUntil, now + cooldownMs)
       }
+    }
+  }
+
+  /**
+   * Smart Quota/Rate Limit handler according to user rules:
+   * 1. Never disable the entire API key! Only isolate this specific model on this key.
+   * 2. Do not immediately believe a first "quota error" / 429 as permanent daily quota exhaustion.
+   * 3. Apply a 1m 10s cooldown (70s) on that model and allow a retry.
+   * 4. Only if it fails AGAIN after cooldown (consecutive >= 2) OR if actual usedToday >= rpdCap,
+   *    mark this model as daily exhausted for today.
+   */
+  public handleQuotaOrRateError(
+    apiKey: string,
+    modelId: string,
+    slot: number = 0,
+    rpdCap: number = 20,
+    isExplicitDailyMsg: boolean = false,
+  ): {
+    action: 'cooldown' | 'exhausted'
+    waitSec: number
+    reason: string
+  } {
+    this.checkDayRollover()
+    const lane = this.getOrCreateLane(apiKey, modelId, slot)
+    const used = getModelUsage(modelId, apiKey)
+
+    // If actual recorded usage has reached or exceeded the daily cap, it is definitively exhausted
+    if (used >= rpdCap) {
+      this.reportExhausted(apiKey, modelId, slot, rpdCap)
+      return {
+        action: 'exhausted',
+        waitSec: 0,
+        reason: `Daily quota limit reached (${used}/${rpdCap} RPD) on ${modelId} (Key ${lane.keyIdx})`,
+      }
+    }
+
+    lane.consecutiveQuotaErrors = (lane.consecutiveQuotaErrors || 0) + 1
+
+    // If it's the 1st quota error, or usage is well below cap (< rpdCap):
+    // Put ONLY this model in 70s cooldown (1 min 10 sec) and give it a chance to retry!
+    if (lane.consecutiveQuotaErrors < 2 && !isExplicitDailyMsg) {
+      this.reportRateLimit(apiKey, modelId, CHUNK_COOLDOWN_MS, slot)
+      return {
+        action: 'cooldown',
+        waitSec: Math.ceil(CHUNK_COOLDOWN_MS / 1000),
+        reason: `Rate/quota spike on ${modelId} (Key ${lane.keyIdx}, used ${used}/${rpdCap} RPD) — cooling down for 1m 10s before retry`,
+      }
+    }
+
+    // If it is explicitly a daily limit error AND consecutive error count >= 2, or used >= rpdCap
+    if (lane.consecutiveQuotaErrors >= 2 || (isExplicitDailyMsg && used >= Math.max(5, rpdCap - 2))) {
+      this.reportExhausted(apiKey, modelId, slot, rpdCap)
+      return {
+        action: 'exhausted',
+        waitSec: 0,
+        reason: `Daily quota confirmed exhausted on ${modelId} (Key ${lane.keyIdx}) after cooldown & retry (${used}/${rpdCap} RPD)`,
+      }
+    }
+
+    // Fallback: temporary 70s cooldown
+    this.reportRateLimit(apiKey, modelId, CHUNK_COOLDOWN_MS, slot)
+    return {
+      action: 'cooldown',
+      waitSec: Math.ceil(CHUNK_COOLDOWN_MS / 1000),
+      reason: `Temporary rate limit on ${modelId} (Key ${lane.keyIdx}) — cooling down for 1m 10s before retry`,
     }
   }
 
