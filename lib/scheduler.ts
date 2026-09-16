@@ -1338,6 +1338,20 @@ class Scheduler {
         // New evidence for an already-finished group (manual chunk retry) — reopen it if unverified.
         if (g.status === 'rejected' || g.status === 'unverified') g.status = 'pending'
       }
+
+      // CRITICAL: If m has userPick, ensure g records it as userPick so applyGroupMatches preserves it!
+      if (m.userPick) {
+        const pickIdx = g.candidates.findIndex(
+          (c) =>
+            Math.abs(c.movieStart - m.movieStart) < 0.5 &&
+            Math.abs(c.movieEnd - m.movieEnd) < 0.5,
+        )
+        if (pickIdx >= 0) {
+          g.userPick = { index: pickIdx, viaRescan: !!m.viaRescan, at: Date.now() }
+          g.status = 'confirmed'
+          g.confirmedIndex = pickIdx
+        }
+      }
     }
     scan.candidateGroups = groups
     // Keep scan.matches cleanly synchronized: exactly one active match per candidate group
@@ -1709,7 +1723,7 @@ class Scheduler {
       }
     }
     scan.matches = (scan.matches || []).filter(
-      (m) => m.verified === true || this.coverage(m.shortStart, m.shortEnd, winner.shortStart, winner.shortEnd) < 0.8,
+      (m) => m.verified === true || m.userPick === true || this.coverage(m.shortStart, m.shortEnd, winner.shortStart, winner.shortEnd) < 0.8,
     )
   }
 
@@ -2232,7 +2246,7 @@ class Scheduler {
     const segStart = seg ? seg.start : 0
     const segEnd = seg ? seg.end : Number.POSITIVE_INFINITY
     scan.matches = (scan.matches || []).filter(
-      (m) => !(m.chunkIndex === chunkIndex && m.shortStart >= segStart && m.shortStart < segEnd),
+      (m) => !(m.chunkIndex === chunkIndex && m.shortStart >= segStart && m.shortStart < segEnd && !m.userPick),
     )
     scan.matches.push(...matches)
     scan.matches.sort((a, b) => a.shortStart - b.shortStart || a.movieStart - b.movieStart)

@@ -63,7 +63,7 @@ export function buildRenderSegments(scan: Pick<Scan, 'matches'>): RenderSegment[
         Math.abs(shortStart - previous.shortEnd) <= 0.25 &&
         Math.abs(movieStart - previous.movieEnd) <= 0.25 &&
         movieEnd > previous.movieEnd &&
-        (!match.userPick || previous.userPick)
+        Boolean(match.userPick) === Boolean(previous.userPick)
       ) {
         previous.shortEnd = shortEnd
         previous.movieEnd = movieEnd

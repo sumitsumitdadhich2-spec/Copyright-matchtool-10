@@ -8,9 +8,9 @@ import { getAllUserApiKeys } from '@/lib/user-keys'
 import { extractClipPrecise } from '@/lib/ffmpeg'
 import { uploadVideo, deleteFileQuiet, rescanRequest, parseRescanMatch } from '@/lib/gemini'
 import { globalGeminiCoordinator } from '@/lib/global-gemini-coordinator'
-import { sameShortSegment } from '@/lib/candidate-pick'
+import { sameShortSegment, applyGroupMatches } from '@/lib/candidate-pick'
+import { invalidateRenderedOutput } from '@/lib/render'
 import { fmtTime } from '@/lib/format'
-import type { ChunkMatch } from '@/lib/types'
 
 export const runtime = 'nodejs'
 
@@ -215,9 +215,15 @@ export async function POST(
     g.confirmedViaRescan = true
     g.userPick = { index: newCandIndex, viaRescan: true, at: Date.now() }
 
-    // Make newly rescanned clip the MAIN clip in scan.matches
-    scan.matches = (scan.matches || []).filter((m) => !sameShortSegment(m.shortStart, m.shortEnd, shortStart, shortEnd))
-    const newMatch: ChunkMatch = {
+    // Make newly rescanned clip the MAIN clip in scan.matches using applyGroupMatches
+    applyGroupMatches(scan, g)
+
+    const newMatch = scan.matches.find(
+      (m) =>
+        m.userPick &&
+        Math.abs(m.movieStart - newMovieStart) < 0.5 &&
+        Math.abs(m.movieEnd - newMovieEnd) < 0.5,
+    ) || {
       shortStart,
       shortEnd,
       movieStart: newMovieStart,
@@ -231,9 +237,13 @@ export async function POST(
       originWindow: g.originWindow,
       reason: `Rescanned via Retry (${selected.modelId}) — User Review`,
     }
-    scan.matches.push(newMatch)
-    scan.matches.sort((a, b) => a.shortStart - b.shortStart || a.movieStart - b.movieStart)
 
+    // Invalidate previous export so render/download exports the updated main clip
+    if (invalidateRenderedOutput(scan)) {
+      addLog(scan, 'warn', '[Rescan Scene] Previous export cleared because main clip was rescanned — render again to export the updated merge')
+    }
+
+    if (scan.report) scan.report.matches = scan.matches
     saveScan(scan, { immediate: true })
 
     addLog(

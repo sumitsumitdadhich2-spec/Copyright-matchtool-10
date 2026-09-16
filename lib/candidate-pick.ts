@@ -76,7 +76,15 @@ export function resolveMainMatches(matches: ChunkMatch[]): ChunkMatch[] {
       const overlap = Math.min(existing.shortEnd, m.shortEnd) - Math.max(existing.shortStart, m.shortStart)
       const shorter = Math.min(existing.shortEnd - existing.shortStart, m.shortEnd - m.shortStart)
       if (overlap > 0 && shorter > 0) {
-        if (overlap >= 0.25 || overlap / shorter >= 0.25) return true
+        // If both are user picks, only near-identical segment (>= 75% overlap) conflicts.
+        if (existing.userPick && m.userPick) {
+          if (overlap / shorter >= 0.75) return true
+          return false
+        }
+        // For general candidates, only a true majority overlap (>= 50%) is a scene conflict.
+        // Seams/boundary overlaps (e.g. 0.1s - 0.4s) between consecutive scenes are NOT conflicts;
+        // buildRenderSegments trims boundary overlaps cleanly so both scenes are preserved.
+        if (overlap / shorter >= 0.5) return true
       }
       return false
     })
@@ -148,13 +156,25 @@ export function applyGroupMatches(scan: Scan, g: CandidateGroup): void {
   const pStart = picked?.shortStart ?? g.shortStart
   const pEnd = picked?.shortEnd ?? g.shortEnd
 
-  // Remove any match that belongs to this group or overlaps this exact short scene
+  // Remove any match that belongs to this group or overlaps this exact short scene.
+  // CRITICAL: A non-user-pick group must NEVER overwrite a match that the user manually picked (userPick === true)!
   scan.matches = (scan.matches || []).filter((m) => {
-    if (sameShortSegment(g.shortStart, g.shortEnd, m.shortStart, m.shortEnd)) return false
-    if (sameShortSegment(pStart, pEnd, m.shortStart, m.shortEnd)) return false
+    const isSameSegment =
+      sameShortSegment(g.shortStart, g.shortEnd, m.shortStart, m.shortEnd) ||
+      sameShortSegment(pStart, pEnd, m.shortStart, m.shortEnd)
+
+    if (isSameSegment) {
+      // If the existing match was picked by the user, and this group is NOT a user pick, preserve the user pick!
+      if (m.userPick && !g.userPick) return true
+      return false
+    }
+
     const overlap = Math.min(m.shortEnd, pEnd) - Math.max(m.shortStart, pStart)
     const shorter = Math.min(m.shortEnd - m.shortStart, pEnd - pStart)
-    if (overlap > 0 && shorter > 0 && overlap / shorter >= 0.3) return false
+    if (overlap > 0 && shorter > 0 && overlap / shorter >= 0.5) {
+      if (m.userPick && !g.userPick) return true
+      return false
+    }
     return true
   })
 

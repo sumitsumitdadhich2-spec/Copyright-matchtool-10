@@ -9,7 +9,9 @@ import { CHUNK_MODEL_POOL, GAP_FINDER_AVAILABLE_MODELS } from './models'
 import { deleteFileQuiet, cleanupOrphanedGeminiFiles, getClient, parseGapFinderOutput, runGapFinderChunk, uploadVideo, classifyError, GeminiError, type GapFinderPartSpec } from './gemini'
 import { COVERAGE_MIN_GAP_SEC, coverageFromRanges, gapsOf, mergeRanges, shortTotalOf } from './short-coverage'
 import { scheduler } from './scheduler'
-import type { ChunkMatch, GapBackupCandidate, GapBackupMinute, GapBackupPart, GapBackupRequest, GapBackupState, Scan, ShortRange } from './types'
+import { sameShortSegment, applyGroupMatches } from './candidate-pick'
+import { invalidateRenderedOutput } from './render'
+import type { GapBackupCandidate, GapBackupMinute, GapBackupPart, GapBackupRequest, GapBackupState, Scan, ShortRange } from './types'
 
 const BATCH_SIZE = 4
 const active = new Map<string, { stopping: boolean }>()
@@ -541,23 +543,70 @@ export function reviewGapCandidate(scan: Scan, candidateId: string, decision: 'a
   if (decision === 'accept') {
     for (const item of state.candidates) if (item.part === candidate.part && item.id !== candidate.id && item.review === 'pending') item.review = 'rejected'
     candidate.review = 'accepted'
-    const match: ChunkMatch = {
-      shortStart: candidate.shortStart,
-      shortEnd: candidate.shortEnd,
-      movieStart: candidate.movieStart,
-      movieEnd: candidate.movieEnd,
-      chunkIndex: candidate.chunkIndex,
-      model: candidate.model,
-      verified: true,
-      userPick: true,
-      origin: 'gap-backup',
+
+    if (!scan.candidateGroups) scan.candidateGroups = []
+    let g = scan.candidateGroups.find((x) =>
+      sameShortSegment(x.shortStart, x.shortEnd, candidate.shortStart, candidate.shortEnd),
+    )
+    if (!g) {
+      g = {
+        id: `g-gap-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        shortStart: candidate.shortStart,
+        shortEnd: candidate.shortEnd,
+        status: 'confirmed',
+        confirmedIndex: 0,
+        confirmedViaRescan: false,
+        origin: 'gap-backup',
+        candidates: [
+          {
+            shortStart: candidate.shortStart,
+            shortEnd: candidate.shortEnd,
+            movieStart: candidate.movieStart,
+            movieEnd: candidate.movieEnd,
+            chunkIndex: candidate.chunkIndex,
+            model: candidate.model,
+            confidence: 0.99,
+            verdict: 'same',
+            rescan: 'none',
+          },
+        ],
+        userPick: { index: 0, viaRescan: false, at: Date.now() },
+      }
+      scan.candidateGroups.push(g)
+    } else {
+      let candIdx = g.candidates.findIndex(
+        (c) =>
+          Math.abs(c.movieStart - candidate.movieStart) < 0.5 &&
+          Math.abs(c.movieEnd - candidate.movieEnd) < 0.5,
+      )
+      if (candIdx === -1) {
+        candIdx = g.candidates.length
+        g.candidates.push({
+          shortStart: candidate.shortStart,
+          shortEnd: candidate.shortEnd,
+          movieStart: candidate.movieStart,
+          movieEnd: candidate.movieEnd,
+          chunkIndex: candidate.chunkIndex,
+          model: candidate.model,
+          confidence: 0.99,
+          verdict: 'same',
+          rescan: 'none',
+        })
+      } else {
+        g.candidates[candIdx].verdict = 'same'
+      }
+      g.status = 'confirmed'
+      g.confirmedIndex = candIdx
+      g.confirmedViaRescan = false
+      g.userPick = { index: candIdx, viaRescan: false, at: Date.now() }
     }
-    scan.matches = scan.matches.filter((item) => !(item.origin === 'gap-backup' && Math.abs(item.shortStart - candidate.shortStart) < 0.1))
-    scan.matches.push(match)
-    scan.matches.sort((a, b) => a.shortStart - b.shortStart)
+
+    applyGroupMatches(scan, g)
     state.addedMatches = scan.matches.filter((item) => item.origin === 'gap-backup')
     const part = state.parts.find((item) => item.index === candidate.part)
     if (part) part.result = 'accepted'
+    invalidateRenderedOutput(scan)
+    if (scan.report) scan.report.matches = scan.matches
   } else {
     candidate.review = 'rejected'
     const part = state.parts.find((item) => item.index === candidate.part)

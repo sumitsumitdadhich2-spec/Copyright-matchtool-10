@@ -16,6 +16,8 @@ import { localMediaPath, findAndReusePrescanMovie, findReusableGeminiMovieUpload
 import { addLog, getScan, saveScan, scanMediaDir, incrementModelUsage, apiKeyHash } from './store'
 import { gapsOf, mergeRanges } from './short-coverage'
 import { globalGeminiCoordinator } from './global-gemini-coordinator'
+import { applyGroupMatches, sameShortSegment } from './candidate-pick'
+import { invalidateRenderedOutput } from './render'
 import type { ChunkMatch, MissingSceneCandidate, MissingSceneScanState, MissingSceneTarget, MissingSceneWindowHit, Scan } from './types'
 
 const MINUTE_FINDER_WINDOW_SEC = 20 * 60 // 20 minutes
@@ -963,27 +965,90 @@ export function reviewMissingSceneCandidate(
       reason: `Missing scene candidate accepted by user (${cand.model})`,
       model: cand.model,
       verified: true,
+      userPick: true,
       origin: 'gap-backup',
     }
 
-    // Merge into scan.matches (deduplicate overlapping ranges)
-    if (!Array.isArray(scan.matches)) scan.matches = []
-    scan.matches = [
-      ...scan.matches.filter((m) => !(m.shortStart >= cand.shortStart && m.shortEnd <= cand.shortEnd)),
-      confirmedMatch,
-    ]
-    scan.matches.sort((a, b) => a.shortStart - b.shortStart)
+    // Synchronize into candidateGroups so CandidateChooser, ComparePanel, and RenderPanel
+    // treat this accepted candidate as the explicit user pick (MAIN clip).
+    if (!scan.candidateGroups) scan.candidateGroups = []
+    let g = scan.candidateGroups.find((x) =>
+      sameShortSegment(x.shortStart, x.shortEnd, cand.shortStart, cand.shortEnd),
+    )
+    if (!g) {
+      g = {
+        id: `g-missing-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        shortStart: cand.shortStart,
+        shortEnd: cand.shortEnd,
+        status: 'confirmed',
+        confirmedIndex: 0,
+        confirmedViaRescan: false,
+        origin: 'gap-backup',
+        candidates: [
+          {
+            shortStart: cand.shortStart,
+            shortEnd: cand.shortEnd,
+            movieStart: cand.movieStart,
+            movieEnd: cand.movieEnd,
+            chunkIndex: cand.chunkIndex,
+            model: cand.model,
+            confidence: 0.99,
+            verdict: 'same',
+            rescan: 'none',
+          },
+        ],
+        userPick: { index: 0, viaRescan: false, at: Date.now() },
+      }
+      scan.candidateGroups.push(g)
+    } else {
+      let candIdx = g.candidates.findIndex(
+        (c) =>
+          Math.abs(c.movieStart - cand.movieStart) < 0.5 &&
+          Math.abs(c.movieEnd - cand.movieEnd) < 0.5,
+      )
+      if (candIdx === -1) {
+        candIdx = g.candidates.length
+        g.candidates.push({
+          shortStart: cand.shortStart,
+          shortEnd: cand.shortEnd,
+          movieStart: cand.movieStart,
+          movieEnd: cand.movieEnd,
+          chunkIndex: cand.chunkIndex,
+          model: cand.model,
+          confidence: 0.99,
+          verdict: 'same',
+          rescan: 'none',
+        })
+      } else {
+        g.candidates[candIdx].verdict = 'same'
+      }
+      g.status = 'confirmed'
+      g.confirmedIndex = candIdx
+      g.confirmedViaRescan = false
+      g.userPick = { index: candIdx, viaRescan: false, at: Date.now() }
+    }
+
+    // Apply group matches to scan.matches (strictly preserves user picks)
+    applyGroupMatches(scan, g)
 
     scan.missingSceneScan.addedMatches = scan.missingSceneScan.addedMatches || []
     if (!scan.missingSceneScan.addedMatches.some((m) => m.shortStart === cand.shortStart && m.movieStart === cand.movieStart)) {
       scan.missingSceneScan.addedMatches.push(confirmedMatch)
     }
 
-    saveScan(scan)
+    // A previously completed export contains the old match list; invalidate it so re-render/download
+    // encodes the newly accepted main scene into the exported MP4.
+    if (invalidateRenderedOutput(scan)) {
+      addLog(scan, 'warn', '[Missing Scene Finder] Previous export cleared because new main clip was accepted — render again to export the updated merge')
+    }
+
+    if (scan.report) scan.report.matches = scan.matches
+
+    saveScan(scan, { immediate: true })
     addLog(
       scan,
       'success',
-      `[Missing Scene Finder] User ACCEPTED candidate: Short ${fmtTime(cand.shortStart)}–${fmtTime(cand.shortEnd)} matches Movie ${fmtTime(cand.movieStart)}–${fmtTime(cand.movieEnd)}!`,
+      `[Missing Scene Finder] User ACCEPTED candidate: Short ${fmtTime(cand.shortStart)}–${fmtTime(cand.shortEnd)} matches Movie ${fmtTime(cand.movieStart)}–${fmtTime(cand.movieEnd)}! Set as MAIN clip.`,
     )
     return { ok: true }
   } else {
@@ -991,15 +1056,27 @@ export function reviewMissingSceneCandidate(
     cand.verified = false
     if (Array.isArray(scan.matches)) {
       scan.matches = scan.matches.filter(
-        (m) => !(m.shortStart === cand.shortStart && m.movieStart === cand.movieStart),
+        (m) => !(Math.abs(m.shortStart - cand.shortStart) < 0.25 && Math.abs(m.movieStart - cand.movieStart) < 0.5),
       )
     }
     if (Array.isArray(scan.missingSceneScan.addedMatches)) {
       scan.missingSceneScan.addedMatches = scan.missingSceneScan.addedMatches.filter(
-        (m) => !(m.shortStart === cand.shortStart && m.movieStart === cand.movieStart),
+        (m) => !(Math.abs(m.shortStart - cand.shortStart) < 0.25 && Math.abs(m.movieStart - cand.movieStart) < 0.5),
       )
     }
-    saveScan(scan)
+    const g = (scan.candidateGroups || []).find((x) =>
+      sameShortSegment(x.shortStart, x.shortEnd, cand.shortStart, cand.shortEnd),
+    )
+    if (g && g.userPick) {
+      const picked = g.candidates[g.userPick.index]
+      if (picked && Math.abs(picked.movieStart - cand.movieStart) < 0.5) {
+        delete g.userPick
+        applyGroupMatches(scan, g)
+      }
+    }
+    invalidateRenderedOutput(scan)
+    if (scan.report) scan.report.matches = scan.matches
+    saveScan(scan, { immediate: true })
     addLog(
       scan,
       'info',
