@@ -806,6 +806,11 @@ class Scheduler {
     let p = lane.chunkUploads.get(chunkIndex)
     if (p) return p
     p = (async () => {
+      // Fast pre-flight check: do not waste bandwidth or Files API uploads if all chunk models on this key are exhausted
+      const hasActiveModel = CHUNK_MODEL_POOL.some((m) => !globalGeminiCoordinator.isModelExhausted(lane.apiKey, m.id, m.rpd))
+      if (!hasActiveModel) {
+        throw new Error(`All chunk models on key ${lane.idx} are exhausted today — upload skipped`)
+      }
       const file = await this.ensureChunkFile(job.scan, chunkIndex)
       if (prefetch) {
         addLog(job.scan, 'info', `Pipeline: chunk ${chunkIndex} pre-uploading in background (key ${lane.idx}) — ready before its turn`)
@@ -857,6 +862,10 @@ class Scheduler {
    *  same 2 queue-head chunks (chunk 66 uploading on keys 1, 5, 3, 2, 6 at once). */
   private prefetchNextChunks(job: Job, lane: KeyLane) {
     if (job.stopping) return
+    // Pre-flight check: if this key has no models with quota remaining, skip prefetch
+    const hasActiveModel = CHUNK_MODEL_POOL.some((m) => !globalGeminiCoordinator.isModelExhausted(lane.apiKey, m.id, m.rpd))
+    if (!hasActiveModel) return
+
     const PREFETCH_DEPTH = 2
     let owned = 0
     for (const ci of job.queue) {
@@ -891,6 +900,10 @@ class Scheduler {
     // Segment upload on every lane (kept in segUris cache — reused, never deleted).
     let announced = false
     for (const lane of job.lanes) {
+      // Skip upload on keys where all models are exhausted
+      const hasActiveModel = CHUNK_MODEL_POOL.some((m) => !globalGeminiCoordinator.isModelExhausted(lane.apiKey, m.id, m.rpd))
+      if (!hasActiveModel) continue
+
       if (lane.segUris.has(next.index) || lane.segUriPromises.has(next.index)) continue
       if (!announced) {
         announced = true
@@ -927,6 +940,8 @@ class Scheduler {
     const preUpload = pendingIdx.slice(0, Math.min(pendingIdx.length, job.lanes.length))
     preUpload.forEach((ci, i) => {
       const lane = job.lanes[i % job.lanes.length]
+      const hasActiveModel = CHUNK_MODEL_POOL.some((m) => !globalGeminiCoordinator.isModelExhausted(lane.apiKey, m.id, m.rpd))
+      if (!hasActiveModel) return
       if (lane.chunkUploads.has(ci) || !this.claimPrefetch(job, lane, ci)) return
       void this.startChunkUpload(job, lane, ci, true).catch(() => job.prefetchOwner.delete(ci))
     })
@@ -1525,7 +1540,7 @@ class Scheduler {
       if (job.stopping || scan.verifierEnabled === false) return
       const st = this.modelState(job, lane, m)
 
-      if (getModelUsage(m.id, lane.apiKey) >= m.rpd) {
+      if (globalGeminiCoordinator.isModelExhausted(lane.apiKey, m.id, m.rpd)) {
         if (st.state !== 'exhausted') {
           st.state = 'exhausted'
           st.currentChunk = null
@@ -1832,10 +1847,10 @@ class Scheduler {
       : undefined
 
     // VERIFY models: gemini-3.5-flash-lite + gemini-3.1-flash-lite ONLY (500 RPD each).
-    // Use worker's assigned model m if within daily quota; otherwise fallback to other verify model.
+    // Instant pre-flight check: ensure quota remaining before cutting clips or uploading
     const pickVerifyModel = (): ModelSpec => {
-      if (getModelUsage(m.id, lane.apiKey) < m.rpd) return m
-      const fallback = VERIFY_MODEL_POOL.find((x) => getModelUsage(x.id, lane.apiKey) < x.rpd)
+      if (!globalGeminiCoordinator.isModelExhausted(lane.apiKey, m.id, m.rpd)) return m
+      const fallback = VERIFY_MODEL_POOL.find((x) => !globalGeminiCoordinator.isModelExhausted(lane.apiKey, x.id, x.rpd))
       if (!fallback) {
         throw new GeminiError(
           'other',
@@ -1942,12 +1957,12 @@ class Scheduler {
           // daily limit khatam ho jaye to rescan lite pool par continue hota
           // hai, kabhi rukta nahi. Use the worker's own model when it is a
           // primary rescan model, otherwise pick primary first, then backup.
-          const primaryRm = isRescanModel(m.id)
+          const primaryRm = isRescanModel(m.id) && !globalGeminiCoordinator.isModelExhausted(lane.apiKey, m.id, m.rpd)
             ? m
-            : RESCAN_MODEL_POOL.find((x) => getModelUsage(x.id, lane.apiKey) < x.rpd)
+            : RESCAN_MODEL_POOL.find((x) => !globalGeminiCoordinator.isModelExhausted(lane.apiKey, x.id, x.rpd))
           const backupRm = primaryRm
             ? null
-            : RESCAN_BACKUP_POOL.find((x) => getModelUsage(x.id, lane.apiKey) < x.rpd)
+            : RESCAN_BACKUP_POOL.find((x) => !globalGeminiCoordinator.isModelExhausted(lane.apiKey, x.id, x.rpd))
           const rm = primaryRm || backupRm
           if (!rm) {
             throw new GeminiError(
@@ -2234,8 +2249,8 @@ class Scheduler {
       if (job.stopping) return
       const st = this.modelState(job, lane, m)
 
-      // RPD check — never send request N+1 past the daily cap.
-      if (getModelUsage(m.id, lane.apiKey) >= m.rpd) {
+      // Fast RPD check via coordinator — instant background check, never send request N+1 past daily cap.
+      if (globalGeminiCoordinator.isModelExhausted(lane.apiKey, m.id, m.rpd)) {
         if (st.state !== 'exhausted') {
           st.state = 'exhausted'
           st.currentChunk = null

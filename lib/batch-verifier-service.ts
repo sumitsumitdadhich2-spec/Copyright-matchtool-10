@@ -141,12 +141,14 @@ async function getBatchCandidateLanes(scan: Scan): Promise<CandidateLane[]> {
   const lanes: CandidateLane[] = []
   allKeys.forEach((apiKey, keyIdx) => {
     for (const modelId of BATCH_VERIFY_MODELS) {
-      lanes.push({
-        apiKey,
-        keyIdx: keyIdx + 1,
-        modelId,
-        rpd: 20,
-      })
+      if (!globalGeminiCoordinator.isModelExhausted(apiKey, modelId, 20)) {
+        lanes.push({
+          apiKey,
+          keyIdx: keyIdx + 1,
+          modelId,
+          rpd: 20,
+        })
+      }
     }
   })
 
@@ -242,6 +244,7 @@ export async function verifySingleMinute(
       let uploadedShort: { uri: string; name: string } | null = null
       let uploadedMovie: { uri: string; name: string } | null = null
       let aiClient: GoogleGenAI | null = null
+      let chosenLane: CandidateLane | null = null
 
       try {
         const { selected: lane, release } = await globalGeminiCoordinator.acquireFirstAvailableLane({
@@ -254,6 +257,7 @@ export async function verifySingleMinute(
           onWait: (msg) => logScan(scanId, 'info', msg),
         })
 
+        chosenLane = lane
         releaseLane = release
         chosenModel = lane.modelId
         minuteResult.model = chosenModel
@@ -300,6 +304,21 @@ export async function verifySingleMinute(
           'warn',
           `[Batch Verifier] Min ${minuteIndex + 1} attempt ${attempts} failed on ${chosenModel || 'model'}: ${geminiErr.message}`,
         )
+
+        if (geminiErr.kind === 'rpd' && chosenLane) {
+          globalGeminiCoordinator.reportExhausted(chosenLane.apiKey, chosenLane.modelId, 0, chosenLane.rpd || 20)
+          logScan(
+            scanId,
+            'warn',
+            `[Batch Verifier] Key ${chosenLane.keyIdx} (${chosenModel}) daily quota exhausted (RPD). Model retired, switching to remaining active keys/models immediately.`,
+          )
+          continue
+        }
+
+        if (geminiErr.kind === 'rate' && chosenLane) {
+          globalGeminiCoordinator.reportRateLimit(chosenLane.apiKey, chosenLane.modelId)
+          continue
+        }
 
         // Prohibited content error: DO NOT RETRY - Stop immediately
         if (geminiErr.kind === 'policy_blocked') {

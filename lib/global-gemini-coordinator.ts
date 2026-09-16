@@ -1,6 +1,13 @@
 import 'server-only'
 
-import { apiKeyHash, getModelUsage, setModelExhausted } from './store'
+import {
+  apiKeyHash,
+  getModelUsage,
+  setModelExhausted,
+  isModelDailyQuotaExhausted,
+  geminiUsageDay,
+  checkDailyReset,
+} from './store'
 import { pacingIntervalMs, RATE_COOLDOWN_MS } from './models'
 
 export interface CandidateLane {
@@ -38,6 +45,42 @@ interface GlobalLaneState {
 
 class GlobalGeminiCoordinator {
   private lanes = new Map<string, GlobalLaneState>()
+  private currentActiveDay = geminiUsageDay()
+
+  /**
+   * Checks if the date has rolled over (midnight Pacific Time).
+   * Automatically clears all exhaustion flags across all lanes so the new day's quota is instantly active!
+   */
+  public checkDayRollover(): boolean {
+    const today = geminiUsageDay()
+    if (today !== this.currentActiveDay) {
+      console.log(`[Global Coordinator] Daily quota rollover detected (${this.currentActiveDay} -> ${today}). Resetting all lane exhaustion flags!`)
+      this.currentActiveDay = today
+      for (const lane of this.lanes.values()) {
+        lane.isExhausted = false
+        lane.cooldownUntil = 0
+      }
+      checkDailyReset()
+      return true
+    }
+    return false
+  }
+
+  /**
+   * Instant, zero-wait quota check:
+   * Verifies if a model on a given API key has exhausted its daily quota (RPD)
+   * using coordinator in-memory lane state and cached counters.json.
+   */
+  public isModelExhausted(apiKey: string, modelId: string, rpdCap: number = 20): boolean {
+    this.checkDayRollover()
+    const lane = this.getOrCreateLane(apiKey, modelId, 0)
+    if (lane.isExhausted) return true
+    if (isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)) {
+      lane.isExhausted = true
+      return true
+    }
+    return false
+  }
 
   private getLaneKey(apiKey: string, modelId: string, slot: number = 0): string {
     return `${apiKeyHash(apiKey)}:${modelId}:${slot}`
@@ -68,17 +111,28 @@ class GlobalGeminiCoordinator {
     return lane
   }
 
-  /** Check if a lane is currently in use by ANY scan or in cooldown/pacing */
-  public isLaneBusy(apiKey: string, modelId: string, slot: number = 0): {
+  /** Check if a lane is currently in use by ANY scan, in cooldown/pacing, or exhausted */
+  public isLaneBusy(apiKey: string, modelId: string, slot: number = 0, rpdCap: number = 20): {
     busy: boolean
+    exhausted?: boolean
     activeScanId?: string
     activeScanTitle?: string
     activeOperation?: string
     waitSec?: number
     cooling?: boolean
   } {
+    this.checkDayRollover()
     const lane = this.getOrCreateLane(apiKey, modelId, slot)
     const now = Date.now()
+
+    if (lane.isExhausted || isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)) {
+      lane.isExhausted = true
+      return {
+        busy: true,
+        exhausted: true,
+        activeOperation: 'Exhausted for today',
+      }
+    }
 
     if (lane.activeScanId) {
       return {
@@ -135,6 +189,7 @@ class GlobalGeminiCoordinator {
     slot?: number
     operation: string
     videoSeconds?: number
+    rpd?: number
     onWait?: (msg: string, waitSec: number) => void
     isStopping?: () => boolean
   }): Promise<(actualVideoSec?: number) => void> {
@@ -147,16 +202,30 @@ class GlobalGeminiCoordinator {
       slot = 0,
       operation,
       videoSeconds = 60,
+      rpd = 20,
       onWait,
       isStopping,
     } = opts
 
+    this.checkDayRollover()
     const lane = this.getOrCreateLane(apiKey, modelId, slot, keyIdx)
+
+    // Pre-flight quota check: if daily quota is already exhausted, abort immediately without waiting or uploading!
+    if (this.isModelExhausted(apiKey, modelId, rpd)) {
+      lane.isExhausted = true
+      throw new Error(`[Global Coordinator] Key ${keyIdx} (${modelId}) daily quota (${rpd} RPD) is exhausted for today. Skipping immediately.`)
+    }
 
     return new Promise<(actualVideoSec?: number) => void>((resolve, reject) => {
       const tryAcquireOrQueue = async () => {
         if (isStopping && isStopping()) {
           reject(new Error('Stop requested — lane acquisition cancelled'))
+          return
+        }
+
+        if (this.isModelExhausted(apiKey, modelId, rpd)) {
+          lane.isExhausted = true
+          reject(new Error(`[Global Coordinator] Key ${keyIdx} (${modelId}) daily quota (${rpd} RPD) is exhausted for today. Skipping immediately.`))
           return
         }
 
@@ -300,16 +369,11 @@ class GlobalGeminiCoordinator {
 
       const now = Date.now()
 
-      // 1. Filter out permanently exhausted / disabled lanes and persist exhausted state
+      this.checkDayRollover()
+
+      // 1. Filter out permanently exhausted / disabled lanes and persist exhausted state instantly
       const availableCandidates = candidates.filter((c) => {
-        const lane = this.getOrCreateLane(c.apiKey, c.modelId, c.slot || 0, c.keyIdx)
-        if (lane.isExhausted) return false
-        const rpdCap = c.rpd || 20
-        if (getModelUsage(c.modelId, c.apiKey) >= rpdCap) {
-          lane.isExhausted = true
-          return false
-        }
-        return true
+        return !this.isModelExhausted(c.apiKey, c.modelId, c.rpd || 20)
       })
 
       if (availableCandidates.length === 0) {
@@ -472,6 +536,13 @@ class GlobalGeminiCoordinator {
     for (const other of this.lanes.values()) {
       if (other.keyHash === kh && other.modelId === modelId) {
         other.isExhausted = true
+        // Reject all queued waiters on this exhausted lane immediately with an error so they don't wait forever!
+        while (other.waiters.length > 0) {
+          const waiter = other.waiters.shift()
+          if (waiter) {
+            waiter.reject(new Error(`[Global Coordinator] Key ${other.keyIdx} (${modelId}) daily quota (${rpdCap} RPD) exhausted`))
+          }
+        }
       }
     }
 

@@ -95,6 +95,26 @@ interface CountersData {
   [key: string]: number | string | undefined
 }
 
+let cachedCounters: CountersData | null = null
+let cachedCountersTimestamp = 0
+const CACHE_TTL_MS = 300 // fast cache: 0ms for tight loops, auto-refreshed periodically
+
+function getCachedCounters(): CountersData {
+  const now = Date.now()
+  if (!cachedCounters || now - cachedCountersTimestamp > CACHE_TTL_MS) {
+    ensureDirs()
+    cachedCounters = readJSON<CountersData>(COUNTERS_FILE, {})
+    cachedCountersTimestamp = now
+  }
+  return cachedCounters
+}
+
+function saveCounters(data: CountersData) {
+  cachedCounters = data
+  cachedCountersTimestamp = Date.now()
+  writeJSON(COUNTERS_FILE, data)
+}
+
 export function geminiUsageDay(now: Date = new Date()): string {
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'America/Los_Angeles',
@@ -117,8 +137,8 @@ function todayKey(): string {
  */
 export function checkDailyReset(): boolean {
   ensureDirs()
-  const counters = readJSON<CountersData>(COUNTERS_FILE, {})
   const today = todayKey()
+  const counters = getCachedCounters()
   const lastDay = counters._lastActiveDay
 
   if (lastDay && lastDay !== today) {
@@ -127,14 +147,14 @@ export function checkDailyReset(): boolean {
       _lastActiveDay: today,
       _lastResetTime: Date.now(),
     }
-    writeJSON(COUNTERS_FILE, newCounters)
+    saveCounters(newCounters)
     return true
   }
 
   if (!counters._lastActiveDay) {
     counters._lastActiveDay = today
     counters._lastResetTime = Date.now()
-    writeJSON(COUNTERS_FILE, counters)
+    saveCounters(counters)
   }
   return false
 }
@@ -145,43 +165,52 @@ function counterKey(model: string, apiKey: string): string {
 
 export function getModelUsage(model: string, apiKey: string): number {
   checkDailyReset()
-  const counters = readJSON<Record<string, number>>(COUNTERS_FILE, {})
-  return counters[counterKey(model, apiKey)] || 0
+  const counters = getCachedCounters()
+  const val = counters[counterKey(model, apiKey)]
+  return typeof val === 'number' ? val : 0
+}
+
+export function isModelDailyQuotaExhausted(model: string, apiKey: string, rpdCap: number = 20): boolean {
+  checkDailyReset()
+  return getModelUsage(model, apiKey) >= rpdCap
 }
 
 export function incrementModelUsage(model: string, apiKey: string): number {
   checkDailyReset()
-  const counters = readJSON<Record<string, number>>(COUNTERS_FILE, {})
+  const counters = getCachedCounters()
   const key = counterKey(model, apiKey)
-  counters[key] = (counters[key] || 0) + 1
+  const nextVal = ((typeof counters[key] === 'number' ? (counters[key] as number) : 0) || 0) + 1
+  counters[key] = nextVal
   // prune keys from other days to keep the file small
   const today = todayKey()
   for (const k of Object.keys(counters)) {
     if (k.startsWith('_')) continue
     if (!k.includes(`|${today}|`)) delete counters[k]
   }
-  writeJSON(COUNTERS_FILE, counters)
-  return counters[key]
+  saveCounters(counters)
+  return nextVal
 }
 
 export function decrementModelUsage(model: string, apiKey: string): number {
   checkDailyReset()
-  const counters = readJSON<Record<string, number>>(COUNTERS_FILE, {})
+  const counters = getCachedCounters()
   const key = counterKey(model, apiKey)
-  if (counters[key] && counters[key] > 0) {
-    counters[key] -= 1
+  const current = typeof counters[key] === 'number' ? (counters[key] as number) : 0
+  if (current > 0) {
+    counters[key] = current - 1
   }
-  writeJSON(COUNTERS_FILE, counters)
-  return counters[key] || 0
+  saveCounters(counters)
+  return (counters[key] as number) || 0
 }
 
 export function setModelExhausted(model: string, apiKey: string, rpd: number) {
   checkDailyReset()
   // Force the counter to the daily cap so it is treated as exhausted everywhere.
-  const counters = readJSON<Record<string, number>>(COUNTERS_FILE, {})
+  const counters = getCachedCounters()
   const key = counterKey(model, apiKey)
-  counters[key] = Math.max(counters[key] || 0, rpd)
-  writeJSON(COUNTERS_FILE, counters)
+  const current = typeof counters[key] === 'number' ? (counters[key] as number) : 0
+  counters[key] = Math.max(current, rpd)
+  saveCounters(counters)
 }
 
 export function resetAllDailyCounters(): void {
@@ -191,7 +220,7 @@ export function resetAllDailyCounters(): void {
     _lastActiveDay: today,
     _lastResetTime: Date.now(),
   }
-  writeJSON(COUNTERS_FILE, newCounters)
+  saveCounters(newCounters)
 }
 
 export function getAllUsage(apiKey: string): Record<string, number> {

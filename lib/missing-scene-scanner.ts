@@ -368,9 +368,9 @@ PART <n>: NOT FOUND — not in this 20-minute window`
     const chunkQueue: number[] = []
     const candidates: MissingSceneCandidate[] = []
 
-    // Build candidate lanes across all keys that have the active movie upload
+    // Build candidate lanes across all keys that have the active movie upload, filtering out any exhausted lanes instantly
     const windowCandLanes = keysWithMovie.flatMap((kw) =>
-      CHUNK_MODEL_POOL.map((m) => ({
+      CHUNK_MODEL_POOL.filter((m) => !globalGeminiCoordinator.isModelExhausted(kw.apiKey, m.id, m.rpd)).map((m) => ({
         apiKey: kw.apiKey,
         keyIdx: kw.keyIdx,
         modelId: m.id,
@@ -380,7 +380,7 @@ PART <n>: NOT FOUND — not in this 20-minute window`
 
     const activeKeys = apiKeys && apiKeys.length > 0 ? apiKeys : [primaryApiKey]
     const chunkCandLanes = activeKeys.flatMap((k: string, ki: number) =>
-      CHUNK_MODEL_POOL.map((m) => ({
+      CHUNK_MODEL_POOL.filter((m) => !globalGeminiCoordinator.isModelExhausted(k, m.id, m.rpd)).map((m) => ({
         apiKey: k,
         keyIdx: ki + 1,
         modelId: m.id,

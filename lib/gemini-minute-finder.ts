@@ -476,8 +476,8 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
   // 4. Higher remaining quota.
   const allKeysWithQuota = apiKeys.map((k, i) => {
     const keyId = apiKeyHash(k)
-    const availableLanes = CHUNK_MODEL_POOL.filter((m) => getModelUsage(m.id, k) < m.rpd)
-    const totalRemaining = CHUNK_MODEL_POOL.reduce((sum, m) => sum + Math.max(0, m.rpd - getModelUsage(m.id, k)), 0)
+    const availableLanes = CHUNK_MODEL_POOL.filter((m) => !globalGeminiCoordinator.isModelExhausted(k, m.id, m.rpd))
+    const totalRemaining = CHUNK_MODEL_POOL.reduce((sum, m) => sum + (globalGeminiCoordinator.isModelExhausted(k, m.id, m.rpd) ? 0 : Math.max(0, m.rpd - getModelUsage(m.id, k))), 0)
     const sObj = getScan(id)
     const hasCachedUploads = Boolean(
       (ctrl.state.uploads[keyId]?.movieUri && ctrl.state.uploads[keyId]?.shortUri) ||
@@ -577,7 +577,7 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
   for (const k of lanesByKey) {
     for (const m of CHUNK_MODEL_POOL) {
       const label = `key ${k.keyIdx} · ${m.id}`
-      if (getModelUsage(m.id, k.apiKey) >= m.rpd) {
+      if (globalGeminiCoordinator.isModelExhausted(k.apiKey, m.id, m.rpd)) {
         skipped.push(label)
         continue
       }
@@ -1011,7 +1011,7 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
 
       // Daily cap reached during the run (shared counter with the chunk scan) —
       // retire this lane, hand the window back to the queue for another lane.
-      if (getModelUsage(lane.model.id, lane.apiKey) >= lane.model.rpd) {
+      if (globalGeminiCoordinator.isModelExhausted(lane.apiKey, lane.model.id, lane.model.rpd)) {
         lane.dead = true
         w.status = 'pending'
         queue.unshift(idx)
