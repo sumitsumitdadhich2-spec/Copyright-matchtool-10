@@ -490,28 +490,41 @@ export function classifyError(err: unknown): GeminiError {
     return new GeminiError('rate', msg)
   }
 
-  // Check if it's explicitly a DAILY quota exhaustion (RPD).
-  // Google Gemini API specifically names daily quotas as:
-  // "GenerateRequestsPerDay" or "requests per day" or "quota metric '...requests per day'" or "generaterequestsperday"
-  // or "per day" / "perday" / "daily requests".
+  // 1. Check if it's explicitly a TEMPORARY minute rate limit (TPM or RPM).
+  // Google Gemini API specifically names minute quotas with "_per_minute_" or "per minute":
+  // e.g. "generate_content_tokens_per_model_per_minute_per_user" (TPM 250k)
+  // or "generate_content_requests_per_model_per_minute_per_user" (RPM 15)
+  // or "Quota exceeded for quota metric 'GenerateContent requests per minute per user'"
+  const isMinuteRateLimit =
+    lower.includes('per_minute') ||
+    lower.includes('per minute') ||
+    lower.includes('perminute') ||
+    lower.includes('rpm') ||
+    lower.includes('tpm') ||
+    lower.includes('_per_minute_') ||
+    lower.includes('minute_per_user')
+
+  // 2. Check if it's explicitly a DAILY quota exhaustion (RPD or 25M daily tokens).
+  // This must NEVER match minute-based rate limits!
   const isExplicitDaily =
-    lower.includes('generaterequestsperday') ||
-    lower.includes('generatetokensperday') ||
-    lower.includes('requests per day') ||
-    lower.includes('request sper day') ||
-    lower.includes('per day') ||
-    lower.includes('perday') ||
-    lower.includes('daily requests') ||
-    lower.includes('tokens_per_model_per_user') ||
-    lower.includes('requests_per_model_per_user') ||
-    lower.includes('generate_content_tokens_per_model') ||
-    lower.includes('generate_content_requests_per_model') ||
-    lower.includes('tokens_per_user') ||
-    lower.includes('requests_per_user') ||
-    lower.includes('_per_model_per_user') ||
-    (lower.includes('daily') && lower.includes('quota')) ||
-    (lower.includes('limit: 20') && lower.includes('daily')) ||
-    (lower.includes('limit: 25000000') || lower.includes('limit: 50000000') || lower.includes('limit: 100000000'))
+    !isMinuteRateLimit &&
+    (
+      lower.includes('generaterequestsperday') ||
+      lower.includes('generatetokensperday') ||
+      lower.includes('generate_requests_per_day') ||
+      lower.includes('generate_content_requests_per_model_per_day') ||
+      lower.includes('generate_content_tokens_per_model_per_day') ||
+      lower.includes('requests per day') ||
+      lower.includes('request sper day') ||
+      lower.includes('requests_per_day') ||
+      lower.includes('tokens per day') ||
+      lower.includes('tokens_per_day') ||
+      lower.includes('_per_day_') ||
+      lower.includes('daily requests') ||
+      (lower.includes('daily') && lower.includes('quota')) ||
+      (lower.includes('limit: 20') && lower.includes('daily')) ||
+      (lower.includes('limit: 25000000') || lower.includes('limit: 50000000') || lower.includes('limit: 100000000'))
+    )
 
   if (isExplicitDaily) {
     return new GeminiError('rpd', msg)

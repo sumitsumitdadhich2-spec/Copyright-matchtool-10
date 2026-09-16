@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getAllUsage, MAX_API_KEYS } from '@/lib/store'
+import { getAllUsage, getAllExhausted, MAX_API_KEYS } from '@/lib/store'
 import {
   getUserKeyN,
   setUserKeyN,
@@ -36,11 +36,13 @@ export async function GET() {
     hasKey: boolean
     maskedKey: string | null
     usage: Record<string, number> | null
+    exhausted: Record<string, boolean> | null
     totalRequests: number
   }[] = []
   for (let n = 1; n <= MAX_API_KEYS; n++) {
     const k = await getUserKeyN(session.username, n)
     const usage = k ? getAllUsage(k) : null
+    const exhausted = k ? getAllExhausted(k) : null
     let totalRequests = 0
     if (usage) {
       for (const val of Object.values(usage)) {
@@ -52,6 +54,7 @@ export async function GET() {
       hasKey: Boolean(k),
       maskedKey: k ? mask(k) : null,
       usage,
+      exhausted,
       totalRequests,
     })
   }
@@ -165,8 +168,10 @@ export async function POST(req: Request) {
   // ----- Reset daily quota counters: { resetCounters: true } -----
   if (body.resetCounters === true) {
     const { resetAllDailyCounters } = await import('@/lib/store')
+    const { globalGeminiCoordinator } = await import('@/lib/global-gemini-coordinator')
     resetAllDailyCounters()
-    return NextResponse.json({ ok: true, message: 'All daily quota counters have been reset to 0' })
+    globalGeminiCoordinator.resetAllLanes()
+    return NextResponse.json({ ok: true, message: 'All daily quota counters and coordinator lanes have been reset to 0' })
   }
 
   // ----- Clear a key slot: { clear: n } -----

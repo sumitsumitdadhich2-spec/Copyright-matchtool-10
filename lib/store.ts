@@ -92,7 +92,7 @@ const COUNTERS_FILE = path.join(DATA_DIR, 'counters.json')
 interface CountersData {
   _lastActiveDay?: string
   _lastResetTime?: number
-  [key: string]: number | string | undefined
+  [key: string]: number | string | boolean | undefined
 }
 
 let cachedCounters: CountersData | null = null
@@ -163,6 +163,10 @@ function counterKey(model: string, apiKey: string): string {
   return `${model}|${todayKey()}|${apiKeyHash(apiKey)}`
 }
 
+function exhaustedKey(model: string, apiKey: string): string {
+  return `_exh|${model}|${todayKey()}|${apiKeyHash(apiKey)}`
+}
+
 export function getModelUsage(model: string, apiKey: string): number {
   checkDailyReset()
   const counters = getCachedCounters()
@@ -172,7 +176,15 @@ export function getModelUsage(model: string, apiKey: string): number {
 
 export function isModelDailyQuotaExhausted(model: string, apiKey: string, rpdCap: number = 20): boolean {
   checkDailyReset()
+  const counters = getCachedCounters()
+  if (counters[exhaustedKey(model, apiKey)] === true) return true
   return getModelUsage(model, apiKey) >= rpdCap
+}
+
+export function getModelExhausted(model: string, apiKey: string): boolean {
+  checkDailyReset()
+  const counters = getCachedCounters()
+  return counters[exhaustedKey(model, apiKey)] === true
 }
 
 export function incrementModelUsage(model: string, apiKey: string): number {
@@ -184,7 +196,7 @@ export function incrementModelUsage(model: string, apiKey: string): number {
   // prune keys from other days to keep the file small
   const today = todayKey()
   for (const k of Object.keys(counters)) {
-    if (k.startsWith('_')) continue
+    if (k.startsWith('_last')) continue
     if (!k.includes(`|${today}|`)) delete counters[k]
   }
   saveCounters(counters)
@@ -203,13 +215,12 @@ export function decrementModelUsage(model: string, apiKey: string): number {
   return (counters[key] as number) || 0
 }
 
-export function setModelExhausted(model: string, apiKey: string, rpd: number) {
+export function setModelExhausted(model: string, apiKey: string, _rpd?: number) {
   checkDailyReset()
-  // Force the counter to the daily cap so it is treated as exhausted everywhere.
   const counters = getCachedCounters()
-  const key = counterKey(model, apiKey)
-  const current = typeof counters[key] === 'number' ? (counters[key] as number) : 0
-  counters[key] = Math.max(current, rpd)
+  // Store explicit exhaustion flag so scheduler stops using it today,
+  // without faking artificial counts in counters[key]!
+  counters[exhaustedKey(model, apiKey)] = true
   saveCounters(counters)
 }
 
@@ -227,6 +238,13 @@ export function getAllUsage(apiKey: string): Record<string, number> {
   checkDailyReset()
   const out: Record<string, number> = {}
   for (const m of MODEL_POOL) out[m.id] = getModelUsage(m.id, apiKey)
+  return out
+}
+
+export function getAllExhausted(apiKey: string): Record<string, boolean> {
+  checkDailyReset()
+  const out: Record<string, boolean> = {}
+  for (const m of MODEL_POOL) out[m.id] = isModelDailyQuotaExhausted(m.id, apiKey, m.rpd)
   return out
 }
 

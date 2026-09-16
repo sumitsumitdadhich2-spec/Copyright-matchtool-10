@@ -2492,8 +2492,6 @@ class Scheduler {
               addLog(scan, 'success', `${minutePrefix}Chunk ${chunkIndex}: Sanitized retry succeeded on ${m.id} (key ${lane.idx}) after policy flag bypass`)
               this.mark(job)
             } catch (retryErr) {
-              const usedRetry = incrementModelUsage(m.id, lane.apiKey)
-              st.usedToday = usedRetry
               chunk.requestCount = (chunk.requestCount || 0) + 1
               this.mark(job)
               throw retryErr

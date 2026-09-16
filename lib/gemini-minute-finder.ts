@@ -1079,7 +1079,6 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
               `${tag} #${w.index}: Sanitized retry succeeded after policy flag bypass (${sendResult.parsed.hits.length} hit(s)) on ${lane.label}`,
             )
           } catch (retryErr) {
-            incrementModelUsage(lane.model.id, lane.apiKey)
             throw retryErr
           }
         } else {

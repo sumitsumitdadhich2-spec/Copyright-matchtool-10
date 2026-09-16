@@ -17,6 +17,7 @@ interface KeySlot {
   hasKey: boolean
   maskedKey: string | null
   usage?: Record<string, number> | null
+  exhausted?: Record<string, boolean> | null
   totalRequests?: number
 }
 
@@ -45,6 +46,29 @@ export function ApiKeyPanel() {
   const [tlSaved, setTlSaved] = useState(false)
   const [cleaningStorage, setCleaningStorage] = useState(false)
   const [cleanMsg, setCleanMsg] = useState<string | null>(null)
+  const [resettingCounters, setResettingCounters] = useState(false)
+  const [resetMsg, setResetMsg] = useState<string | null>(null)
+
+  async function resetQuotaCounters() {
+    if (!confirm('Are you sure you want to reset all Gemini daily usage counters and clear 20/20 exhaustion flags back to 0?')) return
+    setResettingCounters(true)
+    setResetMsg(null)
+    setError(null)
+    const res = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resetCounters: true }),
+    })
+    setResettingCounters(false)
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}))
+      setError(j.error || 'Failed to reset daily quota counters')
+      return
+    }
+    setResetMsg('All daily quota usage counters and model exhaustion states have been reset to 0.')
+    setTimeout(() => setResetMsg(null), 5000)
+    void mutate()
+  }
 
   async function cleanGeminiStorage() {
     setCleaningStorage(true)
@@ -230,8 +254,8 @@ export function ApiKeyPanel() {
                     { id: 'gemini-3.1-flash-lite', name: '3.1 Flash-Lite', rpd: 500 },
                   ]).map((m) => {
                     const used = slot.usage?.[m.id] ?? 0
-                    const isExhausted = used >= m.rpd
-                    const isNear = used >= m.rpd * 0.8
+                    const isExhausted = Boolean(slot.exhausted?.[m.id]) || used >= m.rpd
+                    const isNear = used >= m.rpd * 0.8 && !isExhausted
                     return (
                       <div
                         key={m.id}
@@ -248,6 +272,7 @@ export function ApiKeyPanel() {
                         </span>
                         <span className="font-semibold text-[11px] shrink-0">
                           {used}/{m.rpd}
+                          {isExhausted && used < m.rpd && <span className="ml-1 text-[9px] font-normal opacity-85">(Exh)</span>}
                         </span>
                       </div>
                     )
@@ -312,34 +337,63 @@ export function ApiKeyPanel() {
         </p>
       </div>
 
-      {/* ---------- Gemini Cloud Files API Storage Cleaner (20 GB Quota Protector) ---------- */}
+      {/* ---------- Gemini Cloud Files API Storage Cleaner & Daily Quota Reset ---------- */}
       {slots.some((s) => s.hasKey) && (
-        <div className="mt-4 rounded-lg border border-border bg-card/60 p-3">
-          <div className="flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2">
-              <HardDrive className="size-4 text-primary" aria-hidden />
-              <div>
-                <h2 className="text-sm font-semibold">Gemini Cloud Storage (20 GB Quota Sweep)</h2>
-                <p className="text-xs text-muted-foreground">
-                  Purani temporary uploaded movie/short clips ko Files API se sweep karke 20 GB storage limit free rakhta hai.
-                </p>
+        <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div className="rounded-lg border border-border bg-card/60 p-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <HardDrive className="size-4 text-primary" aria-hidden />
+                <div>
+                  <h2 className="text-sm font-semibold">Gemini Cloud Storage</h2>
+                  <p className="text-xs text-muted-foreground">
+                    Temporary video files sweep (20 GB quota).
+                  </p>
+                </div>
               </div>
+              <button
+                type="button"
+                onClick={() => cleanGeminiStorage()}
+                disabled={cleaningStorage}
+                className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border bg-secondary px-3 py-1.5 text-xs font-medium hover:bg-secondary/80 disabled:opacity-50"
+              >
+                <Sparkles className="size-3.5 text-primary" aria-hidden />
+                {cleaningStorage ? 'Sweeping...' : 'Sweep Storage'}
+              </button>
             </div>
-            <button
-              type="button"
-              onClick={() => cleanGeminiStorage()}
-              disabled={cleaningStorage}
-              className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border bg-secondary px-3 py-1.5 text-xs font-medium hover:bg-secondary/80 disabled:opacity-50"
-            >
-              <Sparkles className="size-3.5 text-primary" aria-hidden />
-              {cleaningStorage ? 'Sweeping Storage...' : 'Sweep Storage Now'}
-            </button>
+            {cleanMsg && (
+              <p className="mt-2 text-xs font-medium text-success">
+                ✓ {cleanMsg}
+              </p>
+            )}
           </div>
-          {cleanMsg && (
-            <p className="mt-2 text-xs font-medium text-success">
-              ✓ {cleanMsg}
-            </p>
-          )}
+
+          <div className="rounded-lg border border-border bg-card/60 p-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <KeyRound className="size-4 text-primary" aria-hidden />
+                <div>
+                  <h2 className="text-sm font-semibold">Daily Quota Counters</h2>
+                  <p className="text-xs text-muted-foreground">
+                    Clear all 20/20 counters & exhaustion flags back to 0.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => resetQuotaCounters()}
+                disabled={resettingCounters}
+                className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border bg-secondary px-3 py-1.5 text-xs font-medium hover:bg-secondary/80 disabled:opacity-50"
+              >
+                {resettingCounters ? 'Resetting...' : 'Reset to 0/20'}
+              </button>
+            </div>
+            {resetMsg && (
+              <p className="mt-2 text-xs font-medium text-success">
+                ✓ {resetMsg}
+              </p>
+            )}
+          </div>
         </div>
       )}
 

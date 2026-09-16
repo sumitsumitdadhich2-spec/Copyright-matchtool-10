@@ -37,6 +37,8 @@ interface GlobalLaneState {
   activeScanTitle: string | null
   activeOperation: string | null
   activeSince: number | null
+  lastOperation: string | null
+  lastOperationVideoSec: number | null
   nextFreeAt: number
   cooldownUntil: number
   isExhausted: boolean
@@ -100,6 +102,8 @@ class GlobalGeminiCoordinator {
         activeScanTitle: null,
         activeOperation: null,
         activeSince: null,
+        lastOperation: null,
+        lastOperationVideoSec: null,
         nextFreeAt: 0,
         cooldownUntil: 0,
         isExhausted: false,
@@ -173,6 +177,19 @@ class GlobalGeminiCoordinator {
       }
     }
     return false
+  }
+
+  /**
+   * Reset all in-memory lane exhaustion and cooldown flags.
+   * Called when user manually resets daily counters via Settings.
+   */
+  public resetAllLanes(): void {
+    for (const lane of this.lanes.values()) {
+      lane.isExhausted = false
+      lane.cooldownUntil = 0
+      lane.nextFreeAt = 0
+    }
+    console.log('[Global Coordinator] All lane exhaustion and cooldown states reset.')
   }
 
   /**
@@ -450,6 +467,8 @@ class GlobalGeminiCoordinator {
     const elapsedSinceActive = lane.activeSince ? Math.max(0, Date.now() - lane.activeSince) : 0
     const remainingPaceMs = Math.max(0, paceMs - elapsedSinceActive)
     lane.nextFreeAt = Date.now() + remainingPaceMs
+    lane.lastOperation = lane.activeOperation
+    lane.lastOperationVideoSec = videoSeconds
     lane.activeScanId = null
     lane.activeScanTitle = null
     lane.activeOperation = null
@@ -518,7 +537,8 @@ class GlobalGeminiCoordinator {
     const lane = this.getOrCreateLane(apiKey, modelId, slot)
     lane.cooldownUntil = Math.max(lane.cooldownUntil, now + cooldownMs)
 
-    // Cooldown ALL slots for this model on this API key so other concurrent workers on the same key don't hit 429
+    // Cooldown only slots for THIS specific model on this API key.
+    // Each model has its own independent 250k TPM and 15 RPM quota!
     for (const other of this.lanes.values()) {
       if (other.keyHash === kh && other.modelId === modelId) {
         other.cooldownUntil = Math.max(other.cooldownUntil, now + cooldownMs)

@@ -160,6 +160,20 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
         isError = true
         errorCategory = 'prohibitedPolicy'
       } else if (
+        lower.includes('daily quota') ||
+        lower.includes('quota exhausted') ||
+        lower.includes('daily limit') ||
+        lower.includes('rpd')
+      ) {
+        isError = true
+        errorCategory = 'dailyExhausted'
+      } else if (lower.includes('404') || lower.includes('unavailable')) {
+        isError = true
+        errorCategory = 'notFound404'
+      } else if (lower.includes('invalid/expired') || lower.includes('invalid api key')) {
+        isError = true
+        errorCategory = 'invalidKey'
+      } else if (
         lower.includes('rate limit') ||
         lower.includes('empty response') ||
         lower.includes('high demand') ||
@@ -174,15 +188,6 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
       ) {
         isError = true
         errorCategory = 'highDemandOrRateLimit'
-      } else if (lower.includes('404') || lower.includes('unavailable')) {
-        isError = true
-        errorCategory = 'notFound404'
-      } else if (lower.includes('invalid/expired') || lower.includes('invalid api key')) {
-        isError = true
-        errorCategory = 'invalidKey'
-      } else if (lower.includes('daily quota') || lower.includes('quota exhausted') || lower.includes('tokens_per_model_per_user')) {
-        isError = true
-        errorCategory = 'dailyExhausted'
       }
 
       if (isError) {

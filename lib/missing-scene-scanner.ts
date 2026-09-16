@@ -605,7 +605,6 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
                   globalGeminiCoordinator.reportRateLimit(selected.apiKey, selected.modelId)
                   continue
                 }
-                incrementModelUsage(selected.modelId, selected.apiKey)
                 throw retryErr
               }
             } else {
@@ -801,9 +800,6 @@ PART <number>: NOT FOUND`
                 if (retryRe.kind === 'rate') {
                   globalGeminiCoordinator.reportRateLimit(selected.apiKey, selected.modelId)
                   continue
-                }
-                if (retryRe.kind === 'policy_blocked') {
-                  incrementModelUsage(selected.modelId, selected.apiKey)
                 }
                 throw retryErr
               }
