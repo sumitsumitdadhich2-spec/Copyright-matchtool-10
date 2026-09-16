@@ -2,7 +2,7 @@
 
 import { useState } from 'react'
 import useSWR from 'swr'
-import { KeyRound, Check, ShieldCheck, X, Sparkles, HardDrive } from 'lucide-react'
+import { KeyRound, Check, ShieldCheck, X, Sparkles, HardDrive, RefreshCw } from 'lucide-react'
 import { fetcher } from '@/lib/format'
 
 interface ModelSpecInfo {
@@ -47,7 +47,28 @@ export function ApiKeyPanel() {
   const [cleaningStorage, setCleaningStorage] = useState(false)
   const [cleanMsg, setCleanMsg] = useState<string | null>(null)
   const [resettingCounters, setResettingCounters] = useState(false)
+  const [reconcilingCounters, setReconcilingCounters] = useState(false)
   const [resetMsg, setResetMsg] = useState<string | null>(null)
+
+  async function reconcileQuotaCounters() {
+    setReconcilingCounters(true)
+    setResetMsg(null)
+    setError(null)
+    const res = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reconcileCounters: true }),
+    })
+    setReconcilingCounters(false)
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}))
+      setError(j.error || 'Failed to sync quota')
+      return
+    }
+    setResetMsg('Quota synced: only actual successful requests today are counted; false exhaustion cleared.')
+    setTimeout(() => setResetMsg(null), 5000)
+    void mutate()
+  }
 
   async function resetQuotaCounters() {
     if (!confirm('Are you sure you want to reset all Gemini daily usage counters and clear 20/20 exhaustion flags back to 0?')) return
@@ -379,14 +400,26 @@ export function ApiKeyPanel() {
                   </p>
                 </div>
               </div>
-              <button
-                type="button"
-                onClick={() => resetQuotaCounters()}
-                disabled={resettingCounters}
-                className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border bg-secondary px-3 py-1.5 text-xs font-medium hover:bg-secondary/80 disabled:opacity-50"
-              >
-                {resettingCounters ? 'Resetting...' : 'Reset to 0/20'}
-              </button>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => reconcileQuotaCounters()}
+                  disabled={reconcilingCounters || resettingCounters}
+                  className="inline-flex shrink-0 items-center gap-1 rounded-md border border-border bg-secondary px-2.5 py-1.5 text-xs font-medium hover:bg-secondary/80 disabled:opacity-50"
+                  title="Recalculate today's usage from actual completed scans and clear false exhaustion flags"
+                >
+                  <RefreshCw className={`size-3 text-primary ${reconcilingCounters ? 'animate-spin' : ''}`} aria-hidden />
+                  {reconcilingCounters ? 'Syncing...' : 'Sync Quota'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => resetQuotaCounters()}
+                  disabled={resettingCounters || reconcilingCounters}
+                  className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border bg-secondary px-3 py-1.5 text-xs font-medium hover:bg-secondary/80 disabled:opacity-50"
+                >
+                  {resettingCounters ? 'Resetting...' : 'Reset to 0/20'}
+                </button>
+              </div>
             </div>
             {resetMsg && (
               <p className="mt-2 text-xs font-medium text-success">

@@ -76,12 +76,13 @@ class GlobalGeminiCoordinator {
   public isModelExhausted(apiKey: string, modelId: string, rpdCap: number = 20): boolean {
     this.checkDayRollover()
     const lane = this.getOrCreateLane(apiKey, modelId, 0)
-    if (lane.isExhausted) return true
-    if (isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)) {
-      lane.isExhausted = true
-      return true
+    const exhaustedInStore = isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)
+    if (!exhaustedInStore) {
+      lane.isExhausted = false
+      return false
     }
-    return false
+    lane.isExhausted = true
+    return true
   }
 
   private getLaneKey(apiKey: string, modelId: string, slot: number = 0): string {

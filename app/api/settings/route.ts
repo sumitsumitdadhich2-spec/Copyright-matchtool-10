@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getAllUsage, getAllExhausted, MAX_API_KEYS } from '@/lib/store'
+import { getAllUsage, getAllExhausted, MAX_API_KEYS, reconcileTodayCounters } from '@/lib/store'
 import {
   getUserKeyN,
   setUserKeyN,
@@ -30,6 +30,13 @@ function mask(key: string) {
 export async function GET() {
   const session = await getSession()
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+
+  // Reconcile and cleanse today's counters and spurious exhaustion flags
+  try {
+    reconcileTodayCounters()
+  } catch (err) {
+    console.error('[Settings GET] Failed to reconcile today counters:', err)
+  }
 
   const keys: {
     index: number
@@ -167,11 +174,22 @@ export async function POST(req: Request) {
 
   // ----- Reset daily quota counters: { resetCounters: true } -----
   if (body.resetCounters === true) {
-    const { resetAllDailyCounters } = await import('@/lib/store')
+    const { resetAllDailyCounters, clearAllExhaustedFlags } = await import('@/lib/store')
     const { globalGeminiCoordinator } = await import('@/lib/global-gemini-coordinator')
     resetAllDailyCounters()
+    clearAllExhaustedFlags()
     globalGeminiCoordinator.resetAllLanes()
     return NextResponse.json({ ok: true, message: 'All daily quota counters and coordinator lanes have been reset to 0' })
+  }
+
+  // ----- Reconcile counters from today's real scans: { reconcileCounters: true } -----
+  if (body.reconcileCounters === true) {
+    const { reconcileTodayCounters, clearAllExhaustedFlags } = await import('@/lib/store')
+    const { globalGeminiCoordinator } = await import('@/lib/global-gemini-coordinator')
+    clearAllExhaustedFlags()
+    globalGeminiCoordinator.resetAllLanes()
+    reconcileTodayCounters()
+    return NextResponse.json({ ok: true, message: 'Counters successfully reconciled from today’s completed scans' })
   }
 
   // ----- Clear a key slot: { clear: n } -----

@@ -565,7 +565,6 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
               /prohibited_content|blocked_by_safety|safety_ratings_blocked|prompt block reason/i.test(re.message)
 
             if (isPolicyBlocked) {
-              incrementModelUsage(selected.modelId, selected.apiKey)
               addLog(
                 scan,
                 'warn',
@@ -751,7 +750,6 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
               /prohibited_content|blocked_by_safety|safety_ratings_blocked|prompt block reason/i.test(re.message)
 
             if (isPolicyBlocked) {
-              incrementModelUsage(selected.modelId, selected.apiKey)
               addLog(
                 scan,
                 'warn',

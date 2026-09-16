@@ -451,14 +451,11 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
               for (const l of allLanes) {
                 if (l.key === lane.key) {
                   l.dead = true
-                  for (const m of GAP_FINDER_AVAILABLE_MODELS) {
-                    setModelExhausted(m.id, l.key, m.rpd)
-                  }
                 }
               }
               queue.push(item)
-              log(scan, 'error', `Missing-scene finder: Key ${lane.keyIndex + 1} is invalid/expired — permanently disabled; chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued for another key`)
-            } else if (e.kind === 'rpd' || e.kind === 'unavailable') {
+              log(scan, 'error', `Missing-scene finder: Key ${lane.keyIndex + 1} is invalid/expired — disabled for this scan; chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued for another key`)
+            } else if (e.kind === 'rpd') {
               setModelExhausted(lane.model.id, lane.key, lane.model.rpd)
               lane.dead = true
               queue.push(item)

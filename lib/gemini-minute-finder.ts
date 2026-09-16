@@ -1050,10 +1050,6 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
           re.kind === 'policy_blocked' ||
           /prohibited_content|blocked_by_safety|safety_ratings_blocked|prompt block reason/i.test(re.message)
 
-        if (isPolicyBlocked) {
-          incrementModelUsage(lane.model.id, lane.apiKey)
-        }
-
         if (isPolicyBlocked && !w.policyRetried) {
           w.policyRetried = true
           log(
@@ -1113,9 +1109,6 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
     } catch (err) {
       const e = err instanceof GeminiError ? err : classifyError(err)
       if (e.kind === 'invalid_key') {
-        for (const m of CHUNK_MODEL_POOL) {
-          setModelExhausted(m.id, lane.apiKey, m.rpd)
-        }
         if (allLanes) {
           for (const l of allLanes) {
             if (l.apiKey === lane.apiKey) l.dead = true
@@ -1125,9 +1118,9 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
         }
         w.status = 'pending'
         queue.push(idx)
-        log(id, 'error', `Key ${lane.keyIdx} is invalid or expired — all lanes for key ${lane.keyIdx} permanently disabled; ${tag.toLowerCase()} #${w.index} re-queued`)
-      } else if (e.kind === 'rpd' || e.kind === 'unavailable') {
-        globalGeminiCoordinator.reportExhausted(lane.apiKey, lane.model.id, 0)
+        log(id, 'error', `Key ${lane.keyIdx} is invalid or expired — all lanes for key ${lane.keyIdx} disabled for this scan; ${tag.toLowerCase()} #${w.index} re-queued`)
+      } else if (e.kind === 'rpd') {
+        globalGeminiCoordinator.reportExhausted(lane.apiKey, lane.model.id, 0, lane.model.rpd)
         setModelExhausted(lane.model.id, lane.apiKey, lane.model.rpd)
         lane.dead = true
         w.status = 'pending'

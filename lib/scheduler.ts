@@ -1624,18 +1624,15 @@ class Scheduler {
       } catch (err) {
         const e = err instanceof GeminiError ? err : classifyError(err)
         if (e.kind === 'invalid_key') {
-          for (const mm of MODEL_POOL) {
-            setModelExhausted(mm.id, lane.apiKey, mm.rpd)
-          }
           const laneState = job.scan.keyLanes.find((l) => l.idx === lane.idx)
           if (laneState) {
             laneState.status = 'error'
             laneState.lastError = 'API key invalid or expired'
-            for (const ms of laneState.models) ms.state = 'exhausted'
           }
           job.verifyQueue.push(gi)
-          addLog(scan, 'error', `Verifier: API Key ${lane.idx} is invalid/expired — permanently disabled; group ${g.id} re-queued for another key`)
-        } else if (e.kind === 'rpd' || e.kind === 'unavailable') {
+          addLog(scan, 'error', `Verifier: API Key ${lane.idx} is invalid/expired — disabled for this scan; group ${g.id} re-queued for another key`)
+        } else if (e.kind === 'rpd') {
+          globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, 0, m.rpd)
           setModelExhausted(m.id, lane.apiKey, m.rpd)
           const laneState = job.scan.keyLanes.find((l) => l.idx === lane.idx)
           if (laneState) {
@@ -1779,17 +1776,10 @@ class Scheduler {
         return rawRes
       } catch (err) {
         const e = err instanceof GeminiError ? err : classifyError(err)
-        if (
-          e.kind === 'policy_blocked' ||
-          /prohibited_content|blocked_by_safety|safety_ratings_blocked|prompt block reason/i.test(e.message)
-        ) {
-          st.usedToday = incrementModelUsage(m.id, lane.apiKey)
-          this.mark(job)
-        }
         if (e.kind === 'rate') {
           globalGeminiCoordinator.reportRateLimit(lane.apiKey, m.id, RATE_COOLDOWN_MS, slot)
-        } else if (e.kind === 'rpd' || e.kind === 'unavailable') {
-          globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, slot)
+        } else if (e.kind === 'rpd') {
+          globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, slot, m.rpd)
         }
         throw err
       }
@@ -2434,11 +2424,6 @@ class Scheduler {
             re.kind === 'policy_blocked' ||
             /prohibited_content|blocked_by_safety|safety_ratings_blocked|prompt block reason/i.test(re.message)
 
-          if (isPolicyBlocked) {
-            // Only safety-blocked requests consume prompt quota on Google's side
-            const used1 = incrementModelUsage(m.id, lane.apiKey)
-            st.usedToday = used1
-          }
           chunk.requestCount = (chunk.requestCount || 0) + 1
           this.mark(job)
 
@@ -2615,20 +2600,16 @@ class Scheduler {
           chunk.status = 'failed'
           addLog(scan, 'error', `${minutePrefix}Chunk ${chunkIndex} reached max retry limit (${chunk.attempts}/${MAX_CHUNK_ATTEMPTS} attempts) — stopped: ${e.message.slice(0, 140)}`)
         } else if (e.kind === 'invalid_key') {
-          for (const mm of MODEL_POOL) {
-            setModelExhausted(mm.id, lane.apiKey, mm.rpd)
-          }
           const laneState = job.scan.keyLanes.find((l) => l.idx === lane.idx)
           if (laneState) {
             laneState.status = 'error'
             laneState.lastError = 'API key invalid or expired'
-            for (const ms of laneState.models) ms.state = 'exhausted'
           }
           chunk.status = 'pending'
           job.queue.push(chunkIndex)
-          addLog(scan, 'error', `API Key ${lane.idx} is invalid/expired — permanently disabled; Chunk ${chunkIndex} re-queued for another key`)
-        } else if (e.kind === 'rpd' || e.kind === 'unavailable') {
-          globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, 0)
+          addLog(scan, 'error', `API Key ${lane.idx} is invalid/expired — disabled for this scan; Chunk ${chunkIndex} re-queued for another key`)
+        } else if (e.kind === 'rpd') {
+          globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, 0, m.rpd)
           setModelExhausted(m.id, lane.apiKey, m.rpd)
           const laneState = job.scan.keyLanes.find((l) => l.idx === lane.idx)
           if (laneState) {

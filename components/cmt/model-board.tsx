@@ -22,7 +22,10 @@ export function ModelBoard({ scan, usage }: { scan: Scan | null; usage: Record<s
       <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
         {MODEL_POOL.map((m) => {
           const live = scan?.modelStates?.[m.id]
-          const used = live?.usedToday ?? usage?.[m.id] ?? 0
+          const isActivelyScanning = scan?.status === 'running' || scan?.status === 'scanning'
+          const used = isActivelyScanning && typeof live?.usedToday === 'number'
+            ? live.usedToday
+            : (usage?.[m.id] ?? (typeof live?.usedToday === 'number' ? live.usedToday : 0))
           const exhausted = used >= m.rpd
           const state: ModelLiveState['state'] = exhausted ? 'exhausted' : live?.state || 'idle'
           const badge = STATE_LABEL[state] || STATE_LABEL.idle
